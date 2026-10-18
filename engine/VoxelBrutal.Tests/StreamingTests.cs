@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using VoxelBrutal.Core.Streaming;
+using VoxelBrutal.Core.Lod;
+using VoxelBrutal.Core.Meshing;
 using VoxelBrutal.Core.World;
 
 namespace VoxelBrutal.Tests;
@@ -11,7 +13,35 @@ internal static class StreamingTests
         yield return ("Streaming rejects late mesh after eviction and re-request", StaleResults);
         yield return ("Streaming bounds requests, jobs and failed generation", BoundsAndErrors);
         yield return ("Upload backpressure retains completed meshes and bounds generation", Backpressure);
+        yield return ("Streaming rejects cancelled topology work at an unchanged content revision", TopologyTickets);
         yield return ("Edits capture immutable halos and invalidate boundary neighbors", Edits);
+    }
+
+    private static void TopologyTickets()
+    {
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        var old = new ChunkMeshId(new ChunkKey(0, 0, 0), 3, 10);
+        var replacement = old with { TopologyStamp = 11 };
+        var pipeline = ChunkPipeline.CreateMeshing((id, ct) =>
+        {
+            if (id == old) { entered.Set(); release.Wait(ct); }
+            return new ChunkMesh(id.Key, id.Revision, [], topologyStamp: id.TopologyStamp);
+        }, new() { WorkerCount = 1 });
+        try
+        {
+            pipeline.Request(old);
+            pipeline.Tick(_ => { });
+            Check(entered.Wait(3000), "Old topology build did not start");
+            pipeline.RetainVersions(new HashSet<ChunkMeshId> { replacement });
+            pipeline.Request(replacement);
+            release.Set();
+            var accepted = new List<ChunkMeshId>();
+            Pump(pipeline, result => accepted.Add(result.Version), () => pipeline.IsReady(replacement));
+            Check(accepted.SequenceEqual(new[] { replacement }) && pipeline.Statistics.Discarded == 1,
+                "An old topology completion escaped into the replacement plan");
+        }
+        finally { release.Set(); pipeline.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
     }
 
     private static void StaleResults()

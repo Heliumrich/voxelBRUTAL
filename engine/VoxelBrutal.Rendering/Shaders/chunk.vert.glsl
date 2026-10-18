@@ -17,9 +17,14 @@ void main() {
     uvec2 uv = corners[vertex];
     // Reversing U preserves a rectangle while reversing its winding.
     if (!positive) uv.x = 1u-uv.x;
-    vec3 p = vec3(q.x & 63u, (q.x>>6u)&63u, (q.x>>12u)&63u);
-    p[(axis+1u)%3u] += float(uv.x * (((q.x>>18u)&31u)+1u));
-    p[(axis+2u)%3u] += float(uv.y * (((q.x>>23u)&31u)+1u));
+    vec3 p = vec3((q.x & 63u) | (((q.y>>16u)&1u)<<6u),
+                  ((q.x>>6u)&63u) | (((q.y>>17u)&1u)<<6u),
+                  ((q.x>>12u)&63u) | (((q.y>>18u)&1u)<<6u));
+    uint width=(((q.x>>18u)&31u) | (((q.y>>19u)&1u)<<5u))+1u;
+    uint height=(((q.x>>23u)&31u) | (((q.y>>20u)&1u)<<5u))+1u;
+    p[(axis+1u)%3u] += float(uv.x*width);
+    p[(axis+2u)%3u] += float(uv.y*height);
+    if((q.y & (1u<<21u))!=0u) p*=.5;
     relativePosition = c.originScale.xyz + p*c.originScale.w;
     normal = vec3(0); normal[axis] = positive ? 1 : -1;
     material = q.y & 65535u;

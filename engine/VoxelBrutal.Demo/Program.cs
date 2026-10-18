@@ -1,42 +1,51 @@
 using System.Diagnostics;
+using System.Text;
 using System.Text.Json;
 using Brutal.GlfwApi;
 using Brutal.Numerics;
-using VoxelBrutal.Core.Lod;
 using VoxelBrutal.Core.Streaming;
 using VoxelBrutal.Core.World;
 using VoxelBrutal.Demo;
 using VoxelBrutal.Rendering;
 
+bool gpuValidation = args.Contains("--validate-occlusion");
 bool stress = args.Contains("--stress");
-bool smoke = args.Contains("--smoke") || stress;
+bool smoke = args.Contains("--smoke") || stress || gpuValidation;
+bool uniform = args.Contains("--uniform");
 int lod = Option("--lod", 0, 0, 6);
-int radius = Option("--radius", smoke ? 3 : 12, 1, 64);
-int frameLimit = Option("--frames", stress ? 900 : smoke ? 240 : 0, 0, 100_000);
+int rootLod = Option("--max-lod", uniform ? lod : Math.Max(5, lod), lod, 10);
+int radius = Option("--radius", smoke ? 12 : 32, 1, 256);
+int budget = Option("--chunk-budget", 8192, 64, 16_384);
+int frameLimit = Option("--frames", stress ? 1800 : smoke ? 1200 : 0, 0, 100_000);
 int workerCount = Option("--workers", Math.Clamp(Environment.ProcessorCount - 2, 1, 8), 1, 32);
+int quadBudgetMiB = Option("--quad-budget-mib", 128, 4, 512);
 bool validation = !args.Contains("--no-validation");
-long selectedSide = 32L << lod;
-long selectedHeight = ChunkKey.FloorDiv(146, selectedSide) - ChunkKey.FloorDiv(-30, selectedSide) + 1;
-if ((2L * radius + 1) * (2L * radius + 1) * selectedHeight > 16_384)
-    throw new ArgumentException("View exceeds the 16,384-chunk CPU budget. Reduce --radius or increase --lod.");
-Console.WriteLine("Voxel BRUTAL foundation — BRUTAL copyright (c) 2024 Ahwoo Limited");
+string? screenshot = TextOption("--screenshot"), report = TextOption("--report");
+var terrainSettings = new TerrainSettings { MinimumY = Option("--min-y", -128, -1_048_576, 1_048_576),
+    MaximumYExclusive = Option("--max-y", 512, -1_048_576, 1_048_576), EnableCaves = !args.Contains("--no-caves") };
+var terrain = new TerrainGenerator(settings: terrainSettings);
+Console.WriteLine("Voxel BRUTAL — BRUTAL copyright (c) 2024 Ahwoo Limited");
 Console.WriteLine("WASD fly · Space/Ctrl vertical · Shift fast · Right mouse / arrows look · E remove · Q place · Esc exit");
-Console.WriteLine($"Uniform LOD {lod}, {1 << lod} voxel scale, chunk radius {radius}. Mixed spatial seams are gated in this milestone.");
+Console.WriteLine($"Cubic32 chunks; vertical [{terrainSettings.MinimumY},{terrainSettings.MaximumYExclusive}); {(uniform ? "uniform" : "adaptive seamless")} LOD {lod}..{rootLod}; GPU Hi-Z {!args.Contains("--no-occlusion")}");
 if (!Glfw.Init()) throw new InvalidOperationException("GLFW initialization failed.");
 try
 {
     Glfw.WindowHint(GlfwWindowHint.ClientApi, 0);
     Glfw.WindowHint(GlfwWindowHint.Visible, smoke ? 0 : 1);
-    using var window = Glfw.CreateWindow(new GlfwWindow.CreateInfo { Title = "Voxel BRUTAL — foundation", Size = new int2(1440, 900) });
-    using var renderer = new VulkanChunkRenderer(window, new RendererOptions { EnableValidation = validation });
-    using var source = new EditableVoxelSource(new TerrainGenerator());
-    var pipeline = new ChunkPipeline(source.Capture, new StreamingOptions { WorkerCount = workerCount });
+    using var window = Glfw.CreateWindow(new GlfwWindow.CreateInfo { Title = "Voxel BRUTAL", Size = new int2(1440, 900) });
+    if (gpuValidation) return OcclusionValidation.Run(window, validation);
+    using var renderer = new VulkanChunkRenderer(window, new RendererOptions { EnableValidation = validation,
+        EnableOcclusion = !args.Contains("--no-occlusion"), EnableColorReadback = screenshot is not null,
+        QuadCapacity = quadBudgetMiB * 1024 * 1024 / 8 });
+    using var source = new EditableVoxelSource(terrain);
+    var streamer = new WorldViewStreamer(source, terrainSettings, renderer, new WorldViewSettings
+    {
+        MinimumLod = lod, RootLod = rootLod, RadiusInBaseChunks = radius, MaximumSelectedChunks = budget,
+        Uniform = uniform, Workers = workerCount, PixelError = Option("--pixel-error", 6, 1, 128)
+    });
     try
     {
-        var camera = new FlyCamera();
-        var desired = new HashSet<ChunkKey>();
-        var known = new HashSet<ChunkKey>();
-        (long X, long Z)? lastCenter = null;
+        var camera = new FlyCamera(new(0, terrain.HeightAt(0, 190) + 70, 190));
         var time = Stopwatch.StartNew();
         double previousTime = time.Elapsed.TotalSeconds, titleTime = 0;
         int frames = 0;
@@ -47,93 +56,73 @@ try
             Glfw.PollEvents();
             if (window.GetKey(GlfwKey.Escape) == GlfwKeyAction.Press) break;
             double now = time.Elapsed.TotalSeconds;
-            float delta = (float)Math.Clamp(now - previousTime, 0, 0.1);
+            float delta = (float)Math.Clamp(now - previousTime, 0, .1);
             previousTime = now;
             if (!smoke) camera.Update(window, delta);
             if (stress)
             {
-                camera.Move(new System.Numerics.Vector3(delta * 90, 0, -delta * 30));
-                camera.Yaw += delta * .2f;
-                if (frames == 200 || frames == 500) camera.Move(new System.Numerics.Vector3(640, 0, -640));
-                if (frames == 100) window.Size = new int2(1000, 700);
-                if (frames == 300) window.Size = new int2(1440, 900);
-            }
-            // The demo is a finite-height terrain view. Core chunk addressing and meshing are fully 3D.
-            long side = 32L << lod;
-            long cx = ChunkKey.FloorDiv(camera.Position.X, side), cz = ChunkKey.FloorDiv(camera.Position.Z, side);
-            if (lastCenter != (cx, cz))
-            {
-                desired.Clear();
-                int minY = (int)ChunkKey.FloorDiv(-30, side), maxY = (int)ChunkKey.FloorDiv(146, side);
-                for (int dz = -radius; dz <= radius; dz++)
-                for (int dx = -radius; dx <= radius; dx++)
-                for (int y = minY; y <= maxY; y++) desired.Add(new(cx + dx, y, cz + dz, lod));
-                foreach (ChunkKey key in known.Where(k => !desired.Contains(k)).ToArray()) renderer.Remove(key);
-                pipeline.Retain(desired);
-                known.IntersectWith(desired);
-                foreach (ChunkKey key in desired.OrderBy(camera.Position.DistanceSquaredTo))
+                camera.Move(new System.Numerics.Vector3(delta * 40, 0, -delta * 15));
+                camera.Yaw += delta * .1f;
+                if (frames == 500 || frames == 1100) camera.Move(new System.Numerics.Vector3(512, 0, -512));
+                if (frames == 200) window.Size = new int2(997, 613);
+                if (frames == 800) window.Size = new int2(1440, 900);
+                if (frames is 400 or 1000 or 1500)
                 {
-                    if (known.Contains(key)) continue;
-                    if (!pipeline.Request(key, source.Revision, camera.Position.DistanceSquaredTo(key)))
-                        throw new InvalidOperationException("Requested view exceeds MaximumTrackedChunks; reduce --radius.");
-                    known.Add(key);
+                    long x = camera.Position.X, z = camera.Position.Z - 64;
+                    streamer.Edit(x, terrain.HeightAt(x, z), z, TerrainGenerator.Air);
                 }
-                lastCenter = (cx, cz);
             }
-
-            if (stress && frames % 60 == 30)
-            {
-                // Stress both replacement publication and halo invalidation while camera demand moves.
-                long editX = camera.Position.X, editZ = camera.Position.Z - 64;
-                long editY = new TerrainGenerator().HeightAt(editX, editZ);
-                foreach (ChunkKey key in source.SetVoxel(editX, editY, editZ, 0, lod))
-                    if (known.Contains(key)) pipeline.Request(key, source.Revision, 0);
-            }
-
-            bool remove = window.GetKey(GlfwKey.E) == GlfwKeyAction.Press;
-            bool place = window.GetKey(GlfwKey.Q) == GlfwKeyAction.Press;
+            bool remove = window.GetKey(GlfwKey.E) == GlfwKeyAction.Press, place = window.GetKey(GlfwKey.Q) == GlfwKeyAction.Press;
             if ((remove && !wasRemove) || (place && !wasPlace))
             {
-                VoxelHit? hit = VoxelRaycast.Cast(source, camera.Position, camera.Forward, 256);
-                if (hit is { } voxel)
-                {
-                    long x = remove ? voxel.X : voxel.PreviousX, y = remove ? voxel.Y : voxel.PreviousY, z = remove ? voxel.Z : voxel.PreviousZ;
-                    foreach (ChunkKey key in source.SetVoxel(x, y, z, remove ? (ushort)0 : TerrainGenerator.Grass, lod))
-                        if (known.Contains(key)) pipeline.Request(key, source.Revision, 0);
-                }
+                if (VoxelRaycast.Cast(source, camera.Position, camera.Forward, 256) is { } hit)
+                    streamer.Edit(remove ? hit.X : hit.PreviousX, remove ? hit.Y : hit.PreviousY,
+                        remove ? hit.Z : hit.PreviousZ, remove ? TerrainGenerator.Air : TerrainGenerator.Grass);
             }
             wasRemove = remove; wasPlace = place;
-            pipeline.Tick(result =>
-            {
-                if (result.Error is not null) throw new InvalidOperationException($"Chunk generation failed: {result.Key}", result.Error);
-                return renderer.TryQueueUpload(result.Mesh!);
-            }, maximumCompletions: 16, milliseconds: 2);
-
             var size = window.FramebufferSize;
             if (size.X > 0 && size.Y > 0)
             {
-                var matrix = camera.ViewProjection(size.X / (float)size.Y);
-                renderer.Draw(new RenderCamera(camera.Position, matrix));
+                streamer.Update(camera.Position, size.Y / (2 * Math.Tan(70 * Math.PI / 360)));
+                renderer.Draw(new RenderCamera(camera.Position, camera.ViewProjection(size.X / (float)size.Y)));
             }
             else Thread.Sleep(16);
             frames++;
             if (now - titleTime >= 1)
             {
                 var s = renderer.Statistics;
-                window.Title = $"Voxel BRUTAL | {s.ResidentChunks:N0} chunks | {s.ResidentQuads:N0} quads | {pipeline.Statistics.Pending} pending | LOD {lod} | {renderer.DeviceName}";
+                window.Title = $"Voxel BRUTAL | {streamer.PublishedChunks:N0}/{streamer.TargetChunks:N0} chunks | {s.ResidentQuads:N0} quads | {s.Occluded:N0} Hi-Z culled | {renderer.DeviceName}";
                 titleTime = now;
             }
-            // Smoke waits for worker scheduling as well as driving real WSI/compute/draw submissions.
             if (smoke) Thread.Sleep(5);
-            if (smoke && time.Elapsed > TimeSpan.FromSeconds(45)) throw new TimeoutException("Vulkan smoke test exceeded 45s.");
+            if (smoke && time.Elapsed > TimeSpan.FromSeconds(90)) throw new TimeoutException("Vulkan smoke test exceeded 90s.");
         }
-        renderer.Dispose(); // Include all submitted work and destruction diagnostics in smoke validation.
-        Console.WriteLine(JsonSerializer.Serialize(new { renderer.DeviceName, renderer.ValidationErrorCount, Renderer = renderer.Statistics,
-            Streaming = pipeline.Statistics, ElapsedSeconds = time.Elapsed.TotalSeconds }, new JsonSerializerOptions { WriteIndented = true }));
-        if (smoke && renderer.Statistics.ResidentQuads == 0) throw new InvalidOperationException("Smoke test submitted no terrain geometry.");
+        renderer.WaitForLastFrame();
+        if (screenshot is not null)
+        {
+            ColorFrame color = renderer.LastColorFrame ?? throw new InvalidOperationException("No GPU color readback.");
+            string path = Path.GetFullPath(screenshot);
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            using var output = File.Create(path);
+            output.Write(Encoding.ASCII.GetBytes($"P6\n{color.Width} {color.Height}\n255\n"));
+            ReadOnlySpan<byte> bgra = color.Pixels.Span;
+            for (int i = 0; i < bgra.Length; i += 4) { output.WriteByte(bgra[i + 2]); output.WriteByte(bgra[i + 1]); output.WriteByte(bgra[i]); }
+        }
+        renderer.Dispose();
+        string json = JsonSerializer.Serialize(new { renderer.DeviceName, renderer.ValidationErrorCount, Renderer = renderer.Statistics,
+            Streaming = streamer.Statistics, streamer.PublishedGeneration, streamer.PublishedChunks, streamer.TargetChunks,
+            streamer.IsSettled, streamer.LodHistogram, streamer.CapacityCoarsenings, QuadBudgetMiB = quadBudgetMiB,
+            VerticalRange = new[] { terrainSettings.MinimumY, terrainSettings.MaximumYExclusive },
+            ElapsedSeconds = time.Elapsed.TotalSeconds }, new JsonSerializerOptions { WriteIndented = true });
+        Console.WriteLine(json);
+        if (report is not null) { string path = Path.GetFullPath(report); Directory.CreateDirectory(Path.GetDirectoryName(path)!); File.WriteAllText(path, json); }
+        if (smoke && streamer.PublishedChunks == 0) throw new InvalidOperationException("Smoke test published no terrain cover.");
+        if (smoke && streamer.Statistics.Failed != 0) throw new InvalidOperationException("Chunk generation failed.");
         if (smoke && renderer.ValidationErrorCount != 0) throw new InvalidOperationException("Vulkan validation reported errors.");
+        if (smoke && !stress && !uniform && streamer.LodHistogram.Count < 2)
+            throw new InvalidOperationException("Smoke test did not publish a mixed-resolution cover.");
     }
-    finally { pipeline.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
+    finally { streamer.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
 }
 finally { Glfw.Terminate(); }
 return 0;
@@ -145,4 +134,11 @@ int Option(string flag, int fallback, int minimum, int maximum)
     if (index + 1 >= args.Length || !int.TryParse(args[index + 1], out int value) || value < minimum || value > maximum)
         throw new ArgumentException($"{flag} needs an integer in [{minimum}, {maximum}].");
     return value;
+}
+string? TextOption(string flag)
+{
+    int index = Array.IndexOf(args, flag);
+    if (index < 0) return null;
+    if (index + 1 >= args.Length) throw new ArgumentException($"{flag} needs a value.");
+    return args[index + 1];
 }

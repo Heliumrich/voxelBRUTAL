@@ -1,5 +1,7 @@
 using System.Threading;
 using VoxelBrutal.Core.World;
+using VoxelBrutal.Core.Lod;
+using VoxelBrutal.Core.Meshing;
 
 namespace VoxelBrutal.Core.Streaming;
 
@@ -31,6 +33,23 @@ public sealed class EditableVoxelSource(IVoxelSource generator) : IVoxelBatchSou
         gate.EnterReadLock();
         try { return ChunkSnapshot.Create(key, new LockedSource(this), requestedRevision, cancellationToken); }
         finally { gate.ExitReadLock(); }
+    }
+
+    /// <summary>Capture own cells and actual neighbor topology under a single read transaction.</summary>
+    public ChunkMesh BuildLodMesh(ChunkMeshId version, LodMeshPlan plan, CancellationToken cancellationToken = default)
+    {
+        if (plan.GetEntry(version.Key).Version != version) throw new ArgumentException("Mesh version does not belong to the plan.", nameof(version));
+        ChunkSnapshot snapshot;
+        LodMeshingContext context;
+        gate.EnterReadLock();
+        try
+        {
+            var sampler = new LockedSource(this);
+            snapshot = ChunkSnapshot.Create(version.Key, sampler, version.Revision, cancellationToken);
+            context = LodMeshingContext.Capture(version.Key, plan, sampler, version.Revision, version.TopologyStamp, cancellationToken);
+        }
+        finally { gate.ExitReadLock(); }
+        return BinaryGreedyMesher.Build(snapshot, context, cancellationToken);
     }
 
     public void FillChunkHalo(ChunkKey key, Span<ushort> destination, CancellationToken cancellationToken = default)

@@ -9,7 +9,7 @@ public sealed record LodSettings
     /// <summary>Viewport height / (2 * tan(vertical FOV / 2)).</summary>
     public double ProjectionScale { get; init; } = 540;
     public int MaxSelectedChunks { get; init; } = 32768;
-    /// <summary>Safe default until an actual spatial seam mesher or POP morphing renderer is integrated.</summary>
+    /// <summary>Conservative default for callers without topology-aware boundary meshing and atomic publication.</summary>
     public bool RequireUniformLod { get; init; } = true;
 
     internal void Validate(int rootLod, int rootCount)

@@ -10,6 +10,8 @@ vec3 palette(uint m) {
     if (m==3u) return vec3(.22,.39,.12); // grass
     if (m==4u) return vec3(.75,.73,.59);
     if (m==5u) return vec3(.86,.9,.94);
+    if (m==6u) return vec3(.20,.31,.16); // moss
+    if (m==7u) return vec3(.68,.64,.53); // limestone
     return .25 + .5*fract(vec3(.618,.417,.713)*float(m));
 }
 void main() {

@@ -19,6 +19,10 @@ public static class LodVisibilityTests
         yield return ("frustum accepts infinite reversed depth", InfiniteReverseDepth);
         yield return ("reverse-Z Hi-Z preserves holes and odd viewport edges", ConservativeOcclusion);
         yield return ("Hi-Z never rejects a rectangle exposed in a full-depth oracle", OcclusionOracle);
+        yield return ("mesh plan captures all four fine neighbors and stable topology versions", MeshPlanTopology);
+        yield return ("mesh plan refuses holes overlap and unbalanced boundary partitions", MeshPlanValidation);
+        yield return ("LOD publication retains balanced topology until every exact GPU version is ready", AtomicPublication);
+        yield return ("cancelled topology builds cannot publish into a newer candidate", SupersededPublication);
     }
 
     public static void Run() { foreach (var (_, test) in Cases()) test(); }
@@ -47,6 +51,11 @@ public static class LodVisibilityTests
             Assert(selection.Desired.Count <= budget, "Balanced split closure exceeded budget.");
             AssertPartition(roots, selection.Desired);
             Assert(LodBoundaryPlan.Build(selection.Desired).All(boundary => boundary.IsTwoToOne), "Neighbor LOD differs by more than one.");
+            var plan = LodMeshPlan.Create(roots, selection.Desired);
+            foreach (var key in plan.Leaves)
+            for (int face = 0; face < 6; face++)
+            foreach (var neighbor in plan.GetFaceNeighbors(key, face))
+                Assert(plan.GetFaceNeighbors(neighbor, face ^ 1).Contains(key), "Every selected adjacency must be reciprocal.");
         }
     }
 
@@ -170,6 +179,105 @@ public static class LodVisibilityTests
                 Assert(nearest < depth[y * width + x], "Hi-Z produced a false occlusion rejection.");
         }
         Assert(rejected > 0, "The conservative oracle test must exercise actual rejections.");
+    }
+
+    private static void MeshPlanTopology()
+    {
+        ChunkKey[] roots = [new(-1, 0, 0, 2), new(0, 0, 0, 2)];
+        var leaves = roots[0].Children().Append(roots[1]).ToArray();
+        var plan = LodMeshPlan.Create(roots, leaves, 3);
+        var fine = roots[0].Children().Where(key => key.X == -1).ToArray();
+        Assert(plan.GetFaceNeighbors(roots[1], 0).ToHashSet().SetEquals(fine), "Coarse face must see all four finer neighbours.");
+        foreach (var key in fine) Assert(plan.GetFaceNeighbors(key, 1).SequenceEqual([roots[1]]), "Fine/coarse adjacency must be reciprocal.");
+        Assert(plan.GetFaceNeighbors(roots[1], 1).Count == 0, "Outside partition must be explicit air.");
+        Assert(plan.TryFindLeaf(-1, 1, 1, out var found) && found == fine[0], "Negative-coordinate lookup must find exact leaf.");
+        Assert(!plan.TryFindLeaf(512, 1, 1, out _), "Lookup outside forest must fail.");
+        var reordered = LodMeshPlan.Create(roots.Reverse().ToArray(), leaves.Reverse().ToArray(), 3);
+        Assert(plan.HasSameVersions(reordered), "Input enumeration order cannot change mesh versions.");
+        var revisions = leaves.ToDictionary(key => key, _ => 3UL);
+        revisions[fine[0]] = 4;
+        var edited = LodMeshPlan.Create(roots, leaves, key => revisions[key]);
+        Assert(plan.GetEntry(roots[1]).Revision == edited.GetEntry(roots[1]).Revision
+            && plan.GetEntry(roots[1]).TopologyStamp != edited.GetEntry(roots[1]).TopologyStamp,
+            "A neighbour edit must invalidate a shared boundary even if own revision is unchanged.");
+        Assert(plan.GetEntry(fine[0]).Revision != edited.GetEntry(fine[0]).Revision, "Own data revision remains part of identity.");
+        var farChild = roots[0].Child(0);
+        var refinedLeaves = leaves.Where(key => key != farChild).Concat(farChild.Children()).ToArray();
+        var refined = LodMeshPlan.Create(roots, refinedLeaves, 3);
+        Assert(refined.GetEntry(roots[1]).Version == plan.GetEntry(roots[1]).Version,
+            "Unrelated interior refinement must not rebuild a distant unchanged boundary.");
+    }
+
+    private static void MeshPlanValidation()
+    {
+        var root = new ChunkKey(0, 0, 0, 2);
+        var children = root.Children().ToArray();
+        Throws<ArgumentException>(() => LodMeshPlan.Create([root], children.Take(7).ToArray()));
+        Throws<ArgumentException>(() => LodMeshPlan.Create([root], children.Append(root).ToArray()));
+        Throws<ArgumentException>(() => LodMeshPlan.Create([root], children.Append(children[0]).ToArray()));
+        Throws<ArgumentException>(() => LodMeshPlan.Create([root], [new(1, 0, 0, 2)]));
+        ChunkKey[] roots = [new(-1, 0, 0, 2), root];
+        var unbalanced = roots[0].Children().SelectMany(child => child.Children()).Append(root).ToArray();
+        Throws<ArgumentException>(() => LodMeshPlan.Create(roots, unbalanced));
+        Assert(LodMeshPlan.Create([], []).Entries.Count == 0, "Empty forest is a valid empty publication.");
+        ChunkKey[] extremes = [ChunkKey.FromWorld(long.MinValue, 0, 0, 3), ChunkKey.FromWorld(long.MaxValue, 0, 0, 3)];
+        var extremePlan = LodMeshPlan.Create(extremes, extremes);
+        Assert(extremePlan.GetFaceNeighbors(extremes[0], 0).Count == 0 && extremePlan.GetFaceNeighbors(extremes[1], 1).Count == 0,
+            "Probing beyond signed world endpoints must not overflow.");
+        Assert(extremePlan.TryFindLeaf(long.MinValue, 0, 0, out var minimum) && minimum == extremes[0]
+            && extremePlan.TryFindLeaf(long.MaxValue, 0, 0, out var maximum) && maximum == extremes[1],
+            "Representable world endpoints remain valid topology addresses.");
+    }
+
+    private static void AtomicPublication()
+    {
+        ChunkKey[] roots = [new(-1, 0, 0, 2), new(0, 0, 0, 2)];
+        var coarse = LodMeshPlan.Create(roots, roots, 1);
+        var refined = LodMeshPlan.Create(roots, roots[0].Children().Append(roots[1]).ToArray(), 1);
+        var publication = new AtomicLodPublication();
+        var resident = new HashSet<ChunkMeshId>();
+        publication.Stage(coarse);
+        Assert(!publication.TryPublish(resident.Contains) && publication.Published is null, "Cold start cannot claim unavailable coverage.");
+        resident.UnionWith(coarse.Entries.Select(entry => entry.Version));
+        Assert(publication.TryPublish(resident.Contains) && publication.Published == coarse, "Complete coarse plan must bootstrap.");
+        publication.Stage(refined);
+        Assert(publication.RequiredVersions.IsSupersetOf(coarse.Entries.Select(entry => entry.Version)), "Keep every old version while replacement loads.");
+        foreach (var entry in refined.Entries.Take(refined.Entries.Count - 1))
+        {
+            resident.Add(entry.Version);
+            Assert(!publication.TryPublish(resident.Contains) && publication.Published == coarse, "Partial topology publication would create seams.");
+            AssertPartition(roots, publication.Published!.Leaves);
+            Assert(LodBoundaryPlan.Build(publication.Published.Leaves).All(boundary => boundary.IsTwoToOne), "Loading must preserve balance.");
+        }
+        var last = refined.Entries[^1].Version;
+        Assert(publication.MissingVersions(resident.Contains).SequenceEqual([last]), "Ready data with old topology is insufficient.");
+        resident.Add(last);
+        Assert(publication.TryPublish(resident.Contains) && publication.Published == refined && publication.Pending is null,
+            "Publish all versions in one owner-thread operation.");
+        Assert(publication.PublishedGeneration == 2 && publication.RequiredVersions.SetEquals(refined.Entries.Select(entry => entry.Version)),
+            "Only replaced versions can retire after publication.");
+        AssertPartition(roots, publication.Published!.Leaves);
+    }
+
+    private static void SupersededPublication()
+    {
+        var root = new ChunkKey(0, 0, 0, 1);
+        var first = LodMeshPlan.Create([root], [root], 1);
+        var stale = LodMeshPlan.Create([root], root.Children().ToArray(), 1);
+        var newer = LodMeshPlan.Create([root], root.Children().ToArray(), 2);
+        var publication = new AtomicLodPublication();
+        var resident = first.Entries.Select(entry => entry.Version).ToHashSet();
+        publication.Stage(first);
+        Assert(publication.TryPublish(resident.Contains), "Bootstrap failed.");
+        publication.Stage(stale);
+        publication.Stage(newer);
+        resident.UnionWith(stale.Entries.Select(entry => entry.Version));
+        Assert(!publication.TryPublish(resident.Contains) && publication.Published == first, "Stale completed versions cannot publish newer plan.");
+        Assert(!publication.RequiredVersions.Overlaps(stale.Entries.Select(entry => entry.Version)), "Superseded staging resources can retire.");
+        publication.CancelPending();
+        Assert(publication.Pending is null && publication.RequiredVersions.SetEquals(first.Entries.Select(entry => entry.Version)), "Cancel must retain only published resources.");
+        publication.Stage(first);
+        Assert(publication.Pending is null, "Restaging published content cannot force redundant work.");
     }
 
     private static void AssertPartition(IReadOnlyList<ChunkKey> roots, IReadOnlyList<ChunkKey> leaves)

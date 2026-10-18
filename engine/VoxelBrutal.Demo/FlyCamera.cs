@@ -6,7 +6,8 @@ namespace VoxelBrutal.Demo;
 
 internal sealed class FlyCamera
 {
-    public WorldPosition Position { get; private set; } = new(0, 145, 190);
+    public WorldPosition Position { get; private set; }
+    public FlyCamera(WorldPosition position) => Position = position;
     public float Yaw { get; set; } = -MathF.PI / 2;
     public float Pitch { get; set; } = -0.38f;
     private bool looking;

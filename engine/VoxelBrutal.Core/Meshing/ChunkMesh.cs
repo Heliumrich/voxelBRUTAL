@@ -1,4 +1,5 @@
 using VoxelBrutal.Core.World;
+using VoxelBrutal.Core.Lod;
 
 namespace VoxelBrutal.Core.Meshing;
 
@@ -8,16 +9,20 @@ public sealed class ChunkMesh
     private readonly PackedQuad[] _quads;
     public ChunkKey Key { get; }
     public ulong Revision { get; }
+    public ulong TopologyStamp { get; }
+    public ChunkMeshId Version => new(Key, Revision, TopologyStamp);
     public ReadOnlySpan<PackedQuad> Quads => _quads;
     public int QuadCount => _quads.Length;
     public int TriangleCount => checked(QuadCount * 2);
     public int ByteSize => checked(QuadCount * 8);
     public int VisibleUnitFaceCount { get; }
 
-    public ChunkMesh(ChunkKey key, ulong revision, ReadOnlySpan<PackedQuad> quads, int visibleUnitFaceCount = -1)
+    public ChunkMesh(ChunkKey key, ulong revision, ReadOnlySpan<PackedQuad> quads, int visibleUnitFaceCount = -1,
+        ulong topologyStamp = 0)
     {
         Key = key;
         Revision = revision;
+        TopologyStamp = topologyStamp;
         _quads = quads.ToArray();
         if (visibleUnitFaceCount < 0)
         {
@@ -28,10 +33,12 @@ public sealed class ChunkMesh
         VisibleUnitFaceCount = visibleUnitFaceCount;
     }
 
-    internal ChunkMesh(ChunkKey key, ulong revision, PackedQuad[] ownedQuads, int visibleUnitFaceCount, bool takeOwnership)
+    internal ChunkMesh(ChunkKey key, ulong revision, PackedQuad[] ownedQuads, int visibleUnitFaceCount, bool takeOwnership,
+        ulong topologyStamp = 0)
     {
         Key = key;
         Revision = revision;
+        TopologyStamp = topologyStamp;
         _quads = takeOwnership ? ownedQuads : (PackedQuad[])ownedQuads.Clone();
         VisibleUnitFaceCount = visibleUnitFaceCount;
     }

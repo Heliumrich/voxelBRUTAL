@@ -17,6 +17,20 @@ public static class BinaryGreedyMesher
     private const ulong InteriorBits = ((1UL << N) - 1) << 1;
 
     public static ChunkMesh Build(ChunkSnapshot snapshot, CancellationToken cancellationToken = default)
+        => BuildCore(snapshot, null, cancellationToken);
+
+    public static ChunkMesh Build(ChunkSnapshot snapshot, LodMeshingContext context,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        ArgumentNullException.ThrowIfNull(context);
+        if (snapshot.Key != context.Key || snapshot.Revision != context.Revision)
+            throw new ArgumentException("The boundary context and interior snapshot must share a key and world revision.", nameof(context));
+        return BuildCore(snapshot, context, cancellationToken);
+    }
+
+    private static ChunkMesh BuildCore(ChunkSnapshot snapshot, LodMeshingContext? context,
+        CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         cancellationToken.ThrowIfCancellationRequested();
@@ -27,7 +41,14 @@ public static class BinaryGreedyMesher
             Array.Clear(masks, 0, 6 * RowsPerFace);
             BuildOccupancy(snapshot.Cells, occupancy, cancellationToken);
             int visibleFaces = BuildFaceMasks(occupancy, masks, cancellationToken);
-            if (visibleFaces == 0)
+            if (context is not null)
+                for (int face = 0; face < 6; face++)
+                {
+                    int start = face * RowsPerFace + ((face & 1) == 0 ? 0 : N - 1) * N;
+                    for (int v = 0; v < N; v++) visibleFaces -= BitOperations.PopCount(masks[start + v]);
+                    Array.Clear(masks, start, N);
+                }
+            if (visibleFaces == 0 && context is null)
                 return new(snapshot.Key, snapshot.Revision, [], 0, takeOwnership: true);
             var quads = new List<PackedQuad>();
             for (int face = 0; face < 6; face++)
@@ -38,13 +59,69 @@ public static class BinaryGreedyMesher
                     MergeSlice(snapshot, masks, face, slice, quads);
                 }
             }
-            return new(snapshot.Key, snapshot.Revision, quads.ToArray(), visibleFaces, takeOwnership: true);
+            if (context is not null)
+                for (int face = 0; face < 6; face++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    visibleFaces += MergeBoundary(snapshot, context, face, quads);
+                }
+            return new(snapshot.Key, snapshot.Revision, quads.ToArray(), visibleFaces, takeOwnership: true,
+                topologyStamp: context?.TopologyStamp ?? 0);
         }
         finally
         {
             ArrayPool<ulong>.Shared.Return(occupancy);
             ArrayPool<ulong>.Shared.Return(masks);
         }
+    }
+
+    private static int MergeBoundary(ChunkSnapshot snapshot, LodMeshingContext context, int face,
+        List<PackedQuad> quads)
+    {
+        int resolution = context.FaceResolution(face);
+        int ratio = resolution / N;
+        int slice = (face & 1) == 0 ? 0 : N - 1;
+        int axis = face / 2;
+        Span<ulong> rows = stackalloc ulong[64];
+        rows.Clear();
+        int faces = 0;
+        for (int v = 0; v < resolution; v++)
+            for (int u = 0; u < resolution; u++)
+                if (MaterialAt(snapshot, axis, slice, u / ratio, v / ratio) != 0 &&
+                    context.NeighborMaterial(face, u, v) == 0)
+                {
+                    rows[v] |= 1UL << u;
+                    faces++;
+                }
+
+        for (int v = 0; v < resolution; v++)
+            while (rows[v] != 0)
+            {
+                int u = BitOperations.TrailingZeroCount(rows[v]);
+                ushort material = MaterialAt(snapshot, axis, slice, u / ratio, v / ratio);
+                int width = 1;
+                while (u + width < resolution && (rows[v] & (1UL << (u + width))) != 0 &&
+                    MaterialAt(snapshot, axis, slice, (u + width) / ratio, v / ratio) == material)
+                    width++;
+                ulong rectangle = width == 64 ? ulong.MaxValue : ((1UL << width) - 1) << u;
+                int height = 1;
+                while (v + height < resolution && (rows[v + height] & rectangle) == rectangle)
+                {
+                    bool same = true;
+                    for (int du = 0; du < width; du++)
+                        if (MaterialAt(snapshot, axis, slice, (u + du) / ratio, (v + height) / ratio) != material)
+                        { same = false; break; }
+                    if (!same) break;
+                    height++;
+                }
+                for (int dv = 0; dv < height; dv++) rows[v + dv] &= ~rectangle;
+                int plane = (face & 1) == 0 ? 0 : resolution;
+                int x = axis == 0 ? plane : axis == 1 ? v : u;
+                int y = axis == 0 ? u : axis == 1 ? plane : v;
+                int z = axis == 0 ? v : axis == 1 ? u : plane;
+                quads.Add(new(x, y, z, width, height, (FaceDirection)face, material, halfVoxelLattice: ratio == 2));
+            }
+        return faces;
     }
 
     private static void BuildOccupancy(ReadOnlySpan<ushort> cells, ulong[] occupancy, CancellationToken ct)

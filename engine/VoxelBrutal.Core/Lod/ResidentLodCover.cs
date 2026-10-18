@@ -10,7 +10,8 @@ public sealed record ResidentLodSelection(
 /// <summary>
 /// Retains a resident ancestor until every desired child subtree has complete resident coverage.
 /// Residency includes upload completion, and an empty mesh is a valid resident result.
-/// This solves loading holes; mixed-resolution spatial seams need a separate transition implementation.
+/// This solves loading holes. Adaptive topology-aware meshes use LodMeshPlan and AtomicLodPublication
+/// instead, so neighbour topology and mesh versions change together while preserving 2:1 balance.
 /// </summary>
 public static class ResidentLodCover
 {

@@ -19,7 +19,7 @@ public readonly record struct LodBoundary(ChunkKey Fine, ChunkKey Coarse, ChunkF
     public bool IsTwoToOne => Coarse.Lod == Fine.Lod + 1;
 }
 
-/// <summary>Describes every finer-side mixed-resolution face. Metadata for a future seam implementation, not seam geometry.</summary>
+/// <summary>Mixed-face diagnostics. LodMeshPlan and LodMeshingContext own the actual transition geometry.</summary>
 public static class LodBoundaryPlan
 {
     public static IReadOnlyList<LodBoundary> Build(IReadOnlyList<ChunkKey> leaves)

@@ -2,11 +2,38 @@
 
 Measured on 18 October 2026 on this Windows development machine. These are development checks, not a frame-rate or maximum-distance claim.
 
+## Second milestone: adaptive LOD and actual GPU Hi-Z
+
+The current Release build has zero warnings/errors and **41 passing CPU cases**. New cases independently expand each selected coarse/fine voxel volume onto a common grid and compare every oriented material face against the complete mesh output. Fixtures cover all axes, both coarse/fine orientations, negative and huge coordinates, corners, edits, topology identity, cancellation, half-grid coordinate/extent64 packing, height settings, 3D caves and continuous climate weights.
+
+The actual Vulkan comparison harness runs with synchronization validation:
+
+```powershell
+$env:VK_LAYER_VALIDATE_SYNC = '1'
+.\build.ps1 Smoke --validate-occlusion
+```
+
+All **eleven GPU image comparisons** matched the reference with exactly **zero differing bytes** and zero Vulkan validation errors on the RTX 4080. The harness tests hidden solid rejection; first-frame recovery after occluder removal, camera rotation and teleportation; restored occluders; near-plane and eye-inside cases; full mesh-version replacement; a 997×613 viewport; coordinate/extent64 carry decoding; and genuine half-voxel GPU coordinates. The reference disables Hi-Z and draws every frustum candidate using the same geometry and camera. Visibility checks use GPU-written per-mesh flags, rather than CPU estimates. Results and paired PPMs are saved under `.artifacts/occlusion-validation/`.
+
+A static cave/biome terrain view loaded a complete **6,406-chunk** mixed cover: 2,320 LOD0, 1,950 LOD1, 1,896 LOD2 and 240 LOD3 chunks. It held 5,098,599 packed quads. GPU readback reported 743 frustum candidates, 102 occluded candidates and 1,541,217 submitted quads. The cover reached publication generation2 and all work/uploads settled, with zero streaming or Vulkan errors. This workload includes the new 3D cave field and is not comparable to the first milestone's simple height-field microbenchmark below. Color readback, validation, generation and sleeps were enabled; its elapsed time is not gameplay FPS.
+
+The GPU arena pressure test used only **8 MiB** of quad storage. It rejected an oversized in-progress candidate, retained the prior complete cover, raised the selection error once, and settled a replacement of 456 chunks spanning LOD0 through LOD4. Its 710,023 quads fit the constrained arena; no work remained and validation reported zero errors. A coarsest root cover that cannot fit reports an explicit capacity error instead of leaving a permanent upload stall.
+
+Terrain now defaults to `[-128,512)`, with 640 vertical voxels. A separate CPU test raises the interval to4096 and confirms cubic chunk allocation is independent of total column height. The generator includes blended climate materials and actual 3D cave air/solid variation. This verifies generation/addressing behavior; it does not establish an unlimited practical view distance.
+
+Profiling found approximately 17.5 ms for selection and 130 ms for topology-plan construction at 6,406 leaves, and boundary sampling dominated the measured build CPU. The demo consequently prepares immutable plans off the render thread, coalesces camera changes, invalidates obsolete edit epochs, and publishes only on the owner thread. Batched/shared boundary sampling and incremental topology reuse remain useful optimization targets.
+
+The final asynchronous-planning stress ran 1,800 submitted frames with moving/turning camera, two teleports, two resizes and three edits. It published fourteen complete topology generations, built 9,526 accepted meshes, retained an active five-level cover during subsequent loading, and ended with zero streaming failures and zero Vulkan/synchronization errors. The changing view was intentionally not settled at exit. Its report is `.artifacts/adaptive-hiz-stress.json`.
+
+## First milestone historical baseline
+
+The remaining baseline measurements were recorded before the cave/biome generator and adaptive topology path were added. They establish the initial implementation's behavior, rather than current performance for the more complex source.
+
 ## Build and CPU correctness
 
 `.\build.ps1 Test` builds the four projects in Release and runs the standalone correctness harness. The solution builds with zero warnings and errors. The harness covers independent scalar meshing oracles, material boundaries, halo suppression, winding, immutable ownership, negative/large coordinates, terrain batch equivalence, cancellation, LOD partition coverage, atomic fallback, frustum conventions, reverse-Z occlusion references, stale worker results, retry, upload backpressure and precise raycasts.
 
-The CPU Hi-Z tests include 2,000 randomized projected rectangles checked against a per-pixel oracle. This does not validate an actual GPU occlusion pass, which remains unimplemented.
+The CPU Hi-Z tests include 2,000 randomized projected rectangles checked against a per-pixel oracle. These remain useful independently of the GPU comparisons above.
 
 ## CPU measurement
 
@@ -47,4 +74,4 @@ Visual verification uses `.\build.ps1 Capture --radius 12 --frames 600`, with Lu
 
 ## Scope of the evidence
 
-This establishes a working modular first renderer on one Windows machine. It does not establish other GPU/vendor/platform behaviour, production frame latency, seamless mixed-resolution rendering, collision/gameplay, persistence, or GPU Hi-Z correctness. The next experiments and acceptance criteria are in [the architecture document](voxel-foundation.md) and [LOD research](voxel-lod-research.md).
+The current evidence establishes the modular renderer, selected mixed-LOD surface coverage and GPU Hi-Z behavior on one Windows machine. It does not establish other GPU/vendor/platform behaviour, production frame latency, smooth visual LOD morphing, thin-feature preservation, collision/gameplay or persistence. Next experiments are in [the architecture document](voxel-foundation.md) and [LOD research](voxel-lod-research.md).

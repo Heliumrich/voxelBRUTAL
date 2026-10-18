@@ -1,10 +1,10 @@
-# Voxel BRUTAL foundation
+# Voxel BRUTAL
 
-A separate engine layer on top of BRUTAL, inside this fork. The upstream framework directories are unchanged. Start with [the architecture and research](../docs/voxel-foundation.md) and [LOD/visibility decisions](../docs/voxel-lod-research.md).
+A modular, editable voxel prototype built on BRUTAL's Vulkan/GLFW bindings. Framework library sources are unchanged. [Architecture](../docs/voxel-foundation.md), [LOD and visibility research](../docs/voxel-lod-research.md), [validation evidence](../docs/voxel-validation.md).
 
 ## Run
 
-Install a stable **.NET 10 SDK**. Rendering needs Vulkan 1.3, graphics/compute/presentation on one queue family, dynamic rendering, synchronization2, multi-draw indirect and nonzero indirect first-instance support. The renderer checks these features and its buffer limits before using a device. Development validation uses the Vulkan SDK's `VK_LAYER_KHRONOS_validation`; pass `--no-validation` if it is unavailable.
+Use a stable **.NET 10 SDK** and a Vulkan 1.3 GPU. Development validation requires `VK_LAYER_KHRONOS_validation` from the Vulkan SDK; `--no-validation` disables it.
 
 From the repository root in PowerShell:
 
@@ -12,35 +12,64 @@ From the repository root in PowerShell:
 .\build.ps1 Test
 .\build.ps1 Demo
 .\build.ps1 Smoke
-.\build.ps1 Bench
-.\build.ps1 Demo --lod 2 --radius 24
-.\build.ps1 Smoke --stress --radius 12
-.\build.ps1 Capture --radius 12 --frames 600
+.\build.ps1 Smoke --validate-occlusion
+.\build.ps1 Smoke --stress --pixel-error 12 --frames 1400
+.\build.ps1 Demo --radius 64 --max-lod 6
+.\build.ps1 Demo --min-y -256 --max-y 1024
 ```
 
-The script uses `.tools/dotnet/dotnet.exe` if present, otherwise the installed `dotnet`. `-DebugBuild` selects Debug instead of Release. `Capture` uses the Vulkan SDK's screenshot layer and writes a frame under `.artifacts/screenshots/`. The session's SDK was downloaded locally, with its official SHA512 verified; it is ignored by Git. A fresh clone needs an installed SDK. NuGet packages are pinned in the rendering project. The published packages are used because this BRUTAL source snapshot does not ship its own project files or native build system, as explained in the upstream README. The source checkout is the reference for API integration.
+WASD flies, Space/Ctrl moves vertically, Shift accelerates, right mouse or arrows turns, E removes a targeted voxel, Q places grass, and Escape exits. This is a fly-through terrain prototype; collision, persistence and gameplay are still future work.
 
-On other platforms, use `dotnet build engine/VoxelBrutal.slnx -c Release`, `dotnet run --project engine/VoxelBrutal.Tests -c Release`, or `dotnet run --project engine/VoxelBrutal.Demo -c Release`. Windows is the verified runtime target for this milestone.
+The script selects `.tools/dotnet/dotnet.exe` when present, otherwise the installed SDK. `-DebugBuild` selects Debug. NuGet versions are pinned. This BRUTAL source snapshot omits framework projects/native build inputs, so native integration uses the published bindings while the engine source lives inside this fork. A fresh clone needs an installed SDK; the locally downloaded SDK/cache is ignored by Git.
 
-The demo is a flying terrain prototype. WASD moves, Space/Ctrl moves vertically, Shift accelerates, right mouse or arrows turns, E removes a targeted voxel, Q places grass, and Escape exits. `--workers N`, `--radius N`, `--lod N`, `--frames N` and `--no-validation` are available. The default view is a 25-by-25 chunk square across six vertical layers, with each chunk covering 32 base voxels. The procedural height bounds limit the demo's vertical requests; the core world and mesher are fully 3D. Views beyond the explicit 16,384 CPU chunk budget are refused.
+On another platform: `dotnet build engine/VoxelBrutal.slnx -c Release`, then `dotnet run --project engine/VoxelBrutal.Demo -c Release`. Windows/RTX 4080 is the verified runtime target. The dependency-free CPU suite is an executable harness; run it with the script or `dotnet run --project engine/VoxelBrutal.Tests -c Release`.
 
-`--lod` configures a uniform voxel scale for the demo. The CPU library also contains adaptive selection and atomic resident coverage. **Seamless mixed-resolution geometry is not enabled.** The safe uniform policy prevents unsupported spatial transitions. The next LOD milestone is globally aligned POP ordering/morphing or a validated transition mesher.
+## World and height
+
+Chunks are **cubic 32×32×32**, addressed with signed 64-bit X/Y/Z coordinates. The default generated interval is **[-128, 512)**: 640 voxels vertically, with a highest editable generated-domain coordinate of 511. `--min-y` and `--max-y` configure content/streaming bounds rather than a chunk-system limit. A 4096-voxel interval is covered by CPU tests. Raising the interval does not allocate a dense vertical column: only selected cubic chunks are generated.
+
+One globally continuous source combines a height field, 3D tunnels/chambers, and climate-dependent cave width and material mixtures. Temperate, arid and alpine weights blend across world coordinates rather than chunk borders. Sparse edits overlay that source. `--no-caves` disables caves. Coarse voxels point-sample the same source, so detail smaller than their voxel scale can disappear; this is not topology-preserving terrain simplification.
+
+## Active rendering features
+
+* Material-aware binary greedy meshing and eight-byte packed quads.
+* Budgeted, face-balanced 2:1 adaptive octree selection, integer-relative camera origins and infinite reverse-Z depth.
+* Shared-boundary meshing against the **actual selected neighboring LODs**. Coarse boundary faces subdivide onto the fine lattice. This creates a closed opaque piecewise-voxel surface without skirts.
+* Atomic mesh-cover publication. Old and candidate versions coexist until every exact replacement and its boundary topology is resident. Edits and canceled work cannot publish mismatched borders.
+* GPU frustum culling, packed-quad vertex pulling, shared mesh arena and indirect draw batches.
+* Actual **current-frame two-phase GPU Hi-Z**: early visible seeds → minimum depth pyramid → late newly-visible geometry. Odd viewport edges, near-plane crossings, camera turns, edits and teleports are checked conservatively.
+* Bounded workers, integration/upload budgets, stale-result rejection, explicit GPU upload pressure and deferred mesh frees.
+
+Spatial closure is implemented. Smooth POP geomorphing, zero LOD popping, conservative thin-feature reduction and transparent-material transitions are separate future work. The exact unit-face oracle establishes the selected blocky surface's coverage, not the quality of its coarse approximation.
+
+## Controls and diagnostics
+
+| Argument | Meaning |
+| --- | --- |
+| `--radius N` | Requested horizontal radius in base chunks (32 voxels), enclosed by complete octree roots |
+| `--lod N`, `--max-lod N` | Finest and root LOD levels; voxel scale is 2^LOD |
+| `--pixel-error N` | Detail-selection scale heuristic, default 6; higher values reduce geometry |
+| `--chunk-budget N` | Maximum candidate leaf count, default 8192 |
+| `--quad-budget-mib N` | Shared packed-quad arena size, default 128 MiB; pressure coarsens an unpublished candidate |
+| `--uniform` | Uniform level selection; default root level equals `--lod`, so use a small radius |
+| `--workers N` | Fixed generation worker count |
+| `--no-occlusion` | GPU frustum/depth baseline for comparisons |
+| `--frames N` | Exit after a bounded number of frames |
+| `--validate-occlusion` | Run actual GPU pixel/visibility comparisons against the uncullled reference |
+| `--report PATH` | Save JSON runtime counters |
+| `--screenshot PATH.ppm` | Save the final GPU-readback image; enables test-only readback overhead |
+
+`--stress` moves/turns the camera, teleports, resizes and edits. Enable synchronization validation with `$env:VK_LAYER_VALIDATE_SYNC = '1'`. Hidden-window elapsed time includes sleeps, generation and validation; it is not a gameplay FPS measurement.
+
+`Bench` records CPU generation/meshing on the current source. Historical height-field baseline figures are in the validation notes; they must not be compared as the same workload after adding caves. `Capture` remains available for LunarG's screenshot layer; `--screenshot` captures a final frame after loading and does not require that layer.
 
 ## Projects
 
 | Project | Responsibility |
 | --- | --- |
-| `VoxelBrutal.Core` | Chunk coordinates/data, immutable halos, procedural source, edits, meshing, LOD, visibility references, streaming and DDA raycasts; no native dependency |
-| `VoxelBrutal.Rendering` | Actual BRUTAL/Vulkan device and swapchain, GPU allocations, upload queue, mesh arena, shaders, compute frustum culling and indirect rendering |
-| `VoxelBrutal.Demo` | GLFW application, camera, streaming demand and edit input |
-| `VoxelBrutal.Tests` | Dependency-free executable correctness suite, independent reference oracles and optional CPU benchmark |
+| Core | World data, generation, edits, snapshots, meshing, LOD plans, CPU visibility references, streaming and raycasts |
+| Rendering | BRUTAL/Vulkan resources, mesh arena, version residency, Hi-Z, indirect draws and GPU diagnostics |
+| Demo | GLFW input/camera, adaptive streaming coordinator and GPU validation scenes |
+| Tests | Independent CPU correctness oracles and optional benchmarks |
 
-Run the executable test harness; `dotnet test` does not discover these tests. Benchmark output describes CPU meshing/generation on this machine, including empty and solid terrain chunks. It is not an FPS result or an arbitrary-terrain worst-case guarantee.
-
-## Milestone boundary
-
-The implemented renderer uses opaque material colours, floating-point reverse-Z, a device-local packed-quad arena, fenced per-frame staging and draw buffers, GPU frustum culling and one multi-draw indirect command per terrain pass. Meshes share allocations; there is no buffer, descriptor or pipeline bind per chunk. Uploads and CPU work have explicit budgets. Mesh ranges retire after their last GPU use completes.
-
-The occlusion pyramid in Core is an independently tested **CPU reference**. The renderer does not yet perform GPU Hi-Z occlusion. Mixed-LOD seam geometry/morphing, LOD hysteresis, texture arrays, ambient occlusion, transparency, persistence, collision, mesh shaders, ray tracing and a gameplay loop remain further milestones. See the research documents for the order and acceptance criteria.
-
-BRUTAL's `NOTICE.txt` and logo are copied beside the demo. A shipped game must also satisfy its required pre-game logo display and credits; the framework's existing licence and third-party notices remain authoritative.
+Textures, ambient lighting, shadows, water, disk storage, collision, mesh shaders and ray tracing remain further milestones. BRUTAL's existing licence/third-party notices remain authoritative; the demo copies its notice and logo assets, while a shipped game also needs the required pre-game display and credits.

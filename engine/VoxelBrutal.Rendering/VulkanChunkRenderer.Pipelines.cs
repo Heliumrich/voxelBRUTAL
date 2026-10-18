@@ -10,11 +10,12 @@ public sealed unsafe partial class VulkanChunkRenderer
     private void CreatePipelines()
     {
         var vertex = CompileShader("chunk.vert.glsl", ShaderKind.VertexShader);
-        VkShaderModule fragment = default, compute = default;
+        VkShaderModule fragment = default, compute = default, pyramid = default;
         try
         {
             fragment = CompileShader("chunk.frag.glsl", ShaderKind.FragmentShader);
             compute = CompileShader("cull.comp.glsl", ShaderKind.ComputeShader);
+            pyramid = CompileShader("pyramid.comp.glsl", ShaderKind.ComputeShader);
             byte* main = stackalloc byte[] { (byte)'m', (byte)'a', (byte)'i', (byte)'n', 0 };
             var stages = stackalloc VkPipelineShaderStageCreateInfo[2];
             stages[0] = new() { Stage = VkShaderStageFlags.VertexBit, Module = vertex, Name = main };
@@ -46,12 +47,18 @@ public sealed unsafe partial class VulkanChunkRenderer
                 Stage = new() { Stage = VkShaderStageFlags.ComputeBit, Module = compute, Name = main } };
             Check(_device.CreateComputePipelines(default, new ReadOnlySpan<VkComputePipelineCreateInfo>(&computeInfo, 1), null, new Span<VkPipeline>(&pipeline, 1)), "create culling pipeline");
             _cullPipeline = pipeline;
+            computeInfo = new VkComputePipelineCreateInfo { Layout = _pyramidPipelineLayout,
+                Stage = new() { Stage = VkShaderStageFlags.ComputeBit, Module = pyramid, Name = main } };
+            Check(_device.CreateComputePipelines(default, new ReadOnlySpan<VkComputePipelineCreateInfo>(&computeInfo, 1), null,
+                new Span<VkPipeline>(&pipeline, 1)), "create depth reduction pipeline");
+            _pyramidPipeline = pipeline;
         }
         finally
         {
             _device.DestroyShaderModule(vertex, null);
             if (!fragment.IsNull()) _device.DestroyShaderModule(fragment, null);
             if (!compute.IsNull()) _device.DestroyShaderModule(compute, null);
+            if (!pyramid.IsNull()) _device.DestroyShaderModule(pyramid, null);
         }
     }
 

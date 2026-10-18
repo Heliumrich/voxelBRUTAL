@@ -5,7 +5,7 @@ using VoxelBrutal.Core.World;
 using VoxelBrutal.Tests;
 
 int failed = 0;
-var cases = WorldMeshingTests.Cases().Concat(LodVisibilityTests.Cases()).Concat(StreamingTests.Cases()).Concat(RaycastTests.Cases());
+var cases = WorldMeshingTests.Cases().Concat(MixedLodMeshingTests.Cases()).Concat(TerrainGenerationTests.Cases()).Concat(LodVisibilityTests.Cases()).Concat(StreamingTests.Cases()).Concat(RaycastTests.Cases());
 foreach ((string name, Action test) in cases)
 {
     try { test(); Console.WriteLine($"PASS {name}"); }

@@ -9,12 +9,13 @@ using Brutal.ShaderCApi;
 using Brutal.VulkanApi;
 using Brutal.VulkanApi.Abstractions;
 using VoxelBrutal.Core.Meshing;
+using VoxelBrutal.Core.Lod;
 using VoxelBrutal.Core.World;
 
 namespace VoxelBrutal.Rendering;
 
 /// <summary>
-/// Vulkan 1.3 renderer with packed-quad pulling, compute frustum culling and one MDI batch.
+/// Vulkan 1.3 renderer with packed-quad pulling, current-frame two-phase Hi-Z and indirect submission.
 /// All public methods belong to the GLFW/render thread. Uploads are immutable publications.
 /// </summary>
 public sealed unsafe partial class VulkanChunkRenderer : IDisposable
@@ -42,16 +43,28 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     private VkPipelineLayout _pipelineLayout;
     private VkPipeline _graphicsPipeline;
     private VkPipeline _cullPipeline;
+    private VkDescriptorSetLayout _pyramidSetLayout;
+    private VkDescriptorPool _pyramidDescriptorPool;
+    private VkPipelineLayout _pyramidPipelineLayout;
+    private VkPipeline _pyramidPipeline;
+    private VkSampler _depthSampler;
+    private int _pyramidWidth, _pyramidHeight, _pyramidMips;
     private GpuBuffer _quads = null!;
     private readonly List<FrameResources> _frames = [];
     private readonly QuadArena _arena;
-    private readonly Dictionary<ChunkKey, Resident> _resident = [];
-    private readonly Dictionary<ChunkKey, ChunkMesh> _pending = [];
-    private readonly LinkedList<ChunkKey> _uploadOrder = [];
-    private readonly Dictionary<ChunkKey, LinkedListNode<ChunkKey>> _uploadNodes = [];
+    private readonly Dictionary<ChunkMeshId, Resident> _resident = [];
+    private readonly Dictionary<ChunkKey, ChunkMeshId> _latestMeshByKey = [];
+    private readonly Dictionary<ChunkMeshId, ChunkMesh> _pending = [];
+    private readonly LinkedList<ChunkMeshId> _uploadOrder = [];
+    private readonly Dictionary<ChunkMeshId, LinkedListNode<ChunkMeshId>> _uploadNodes = [];
     private long _pendingUploadBytes;
     private readonly Queue<(long Serial, QuadArena.Range Range)> _retired = [];
     private IReadOnlySet<ChunkKey>? _activeChunks;
+    private IReadOnlySet<ChunkMeshId>? _activeMeshes;
+    private HashSet<ChunkMeshId> _visibilityHistory = [];
+    private long _readbackSerial;
+    private int _earlyVisible, _lateVisible, _occluded, _frustumVisible;
+    private long _drawnQuads;
     private long _submitted;
     private long _completed;
     private bool _disposed;
@@ -60,8 +73,14 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     public RendererStatistics Statistics { get; private set; }
     public int ValidationErrorCount => Volatile.Read(ref _validationErrors);
     public long PendingUploadBytes => _pendingUploadBytes;
+    public int QuadCapacity => _options.QuadCapacity;
+    /// <summary>The most recent upload pass stopped because no safe arena range could fit its next mesh.</summary>
+    public bool UploadCapacityBlocked { get; private set; }
+    public bool OcclusionEnabled { get; set; }
+    public IReadOnlySet<ChunkMeshId> LastVisibleMeshes => _visibilityHistory;
+    public ColorFrame? LastColorFrame { get; private set; }
 
-    private sealed record Resident(ChunkKey Key, ulong Revision, QuadArena.Range Range);
+    private sealed record Resident(ChunkMeshId Id, QuadArena.Range Range);
     [StructLayout(LayoutKind.Sequential)]
     private struct GpuChunk
     {
@@ -69,7 +88,12 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         public uint FirstQuad, QuadCount, Reserved0, Reserved1;
     }
     [StructLayout(LayoutKind.Sequential)]
-    private struct PushData { public Matrix4x4 ViewProjection; public uint Count; }
+    private struct PushData
+    {
+        public Matrix4x4 ViewProjection;
+        public uint Count, Pass, Occlusion, Reserved;
+        public Vector4 ViewportPyramid;
+    }
 
     private sealed class FrameResources
     {
@@ -78,7 +102,14 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         public VkFence Fence;
         public VkSemaphore Acquired;
         public VkDescriptorSet Set;
-        public GpuBuffer Staging = null!, Chunks = null!, Indirect = null!;
+        public GpuBuffer Staging = null!, Chunks = null!, Indirect = null!, Visibility = null!;
+        public GpuBuffer? ColorReadback;
+        public ChunkMeshId[] SubmittedMeshes = [];
+        public VkImage Pyramid;
+        public VkDeviceMemory PyramidMemory;
+        public VkImageView PyramidView;
+        public VkImageView[] PyramidMipViews = [];
+        public VkDescriptorSet[] PyramidSets = [];
         public VkImage Depth;
         public VkImageView DepthView;
         public VkDeviceMemory DepthMemory;
@@ -89,6 +120,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     {
         _window = window;
         _options = options ?? new();
+        OcclusionEnabled = _options.EnableOcclusion;
         if (_options.QuadCapacity <= 0 || _options.QuadCapacity > int.MaxValue / 8 || _options.MaxChunks <= 0
             || _options.UploadBytesPerFrame < 8 || _options.MaxPendingUploadBytes < _options.UploadBytesPerFrame)
             throw new ArgumentOutOfRangeException(nameof(options));
@@ -113,34 +145,54 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     public bool TryQueueUpload(ChunkMesh mesh)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_resident.TryGetValue(mesh.Key, out var current) && current.Revision >= mesh.Revision) return true;
-        if (_pending.TryGetValue(mesh.Key, out var pending) && pending.Revision >= mesh.Revision) return true;
+        var id = mesh.Version;
+        if (_resident.ContainsKey(id) || _pending.ContainsKey(id)) return true;
         if (mesh.QuadCount > _options.QuadCapacity) throw new InvalidOperationException("One chunk exceeds QuadCapacity.");
         if (mesh.Quads.Length * 8L > _options.UploadBytesPerFrame)
             throw new InvalidOperationException("One chunk exceeds the upload staging budget. Increase UploadBytesPerFrame.");
-        var newBytes = _pendingUploadBytes - (pending?.ByteSize ?? 0) + mesh.ByteSize;
-        if (newBytes > _options.MaxPendingUploadBytes || (pending is null && _pending.Count >= _options.MaxChunks)) return false;
-        if (pending is null) _uploadNodes[mesh.Key] = _uploadOrder.AddLast(mesh.Key);
-        _pending[mesh.Key] = mesh;
+        var newBytes = _pendingUploadBytes + mesh.ByteSize;
+        if (newBytes > _options.MaxPendingUploadBytes || _pending.Count >= _options.MaxChunks) return false;
+        _uploadNodes[id] = _uploadOrder.AddLast(id);
+        _pending[id] = mesh;
         _pendingUploadBytes = newBytes;
         return true;
     }
 
     public void Remove(ChunkKey key)
     {
-        if (_pending.Remove(key, out var pending))
-        {
-            _pendingUploadBytes -= pending.ByteSize;
-            _uploadOrder.Remove(_uploadNodes[key]);
-            _uploadNodes.Remove(key);
-        }
-        if (_resident.Remove(key, out var old)) _retired.Enqueue((_submitted, old.Range));
+        foreach (var id in _pending.Keys.Concat(_resident.Keys).Where(id => id.Key == key).Distinct().ToArray()) Remove(id);
     }
 
-    public bool IsResident(ChunkKey key) => _resident.ContainsKey(key);
+    public void Remove(ChunkMeshId id)
+    {
+        if (_pending.Remove(id, out var pending))
+        {
+            _pendingUploadBytes -= pending.ByteSize;
+            _uploadOrder.Remove(_uploadNodes[id]);
+            _uploadNodes.Remove(id);
+        }
+        if (_resident.Remove(id, out var old)) _retired.Enqueue((_submitted, old.Range));
+        if (_latestMeshByKey.TryGetValue(id.Key, out var latest) && latest == id)
+        {
+            var remaining = _resident.Keys.Where(other => other.Key == id.Key).OrderBy(other => other.Revision).ToArray();
+            if (remaining.Length == 0) _latestMeshByKey.Remove(id.Key);
+            else _latestMeshByKey[id.Key] = remaining[^1];
+        }
+        _visibilityHistory.Remove(id);
+    }
+
+    public bool IsResident(ChunkKey key) => _resident.Keys.Any(id => id.Key == key);
+    public bool IsResident(ChunkMeshId id) => _resident.ContainsKey(id);
+
+    public void RetainMeshes(IReadOnlySet<ChunkMeshId> ids)
+    {
+        foreach (var id in _pending.Keys.Concat(_resident.Keys).Where(id => !ids.Contains(id)).Distinct().ToArray()) Remove(id);
+    }
+
+    public void SetActiveMeshes(IReadOnlySet<ChunkMeshId>? ids) { _activeMeshes = ids; _activeChunks = null; }
 
     /// <summary>Restricts draws to an atomic resident cover; null draws every resident mesh.</summary>
-    public void SetActiveChunks(IReadOnlySet<ChunkKey>? keys) => _activeChunks = keys;
+    public void SetActiveChunks(IReadOnlySet<ChunkKey>? keys) { _activeChunks = keys; _activeMeshes = null; }
 
     /// <summary>Renders one frame. Returns false while minimized or when a resize needs a new acquire.</summary>
     public bool Draw(RenderCamera camera)
@@ -151,6 +203,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         if (size.X != _extent.Width || size.Y != _extent.Height) RecreateSwapchain();
         var frame = _frames[_frameIndex];
         Check(_device.WaitForFences([frame.Fence], true, -1), "wait frame fence");
+        ProcessReadback(frame);
         _completed = Math.Max(_completed, frame.Serial);
         while (_retired.TryPeek(out var retired) && retired.Serial <= _completed)
         {
@@ -184,7 +237,8 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         if (result is VkResult.ErrorOutOfDateKHR or VkResult.SuboptimalKHR || acquire == VkResult.SuboptimalKHR) RecreateSwapchain();
         else Check(result, "present");
         _frameIndex = (_frameIndex + 1) % FramesInFlight;
-        Statistics = new(_resident.Count, _resident.Values.Sum(r => (long)r.Range.Count), _pending.Count, uploadBytes, count, _submitted);
+        Statistics = new(_resident.Count, _resident.Values.Sum(r => (long)r.Range.Count), _pending.Count, uploadBytes, count, _submitted,
+            _earlyVisible, _lateVisible, _occluded, _frustumVisible, _readbackSerial, _drawnQuads);
         return true;
     }
 
@@ -250,16 +304,30 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
 
     private void CreateDescriptorsAndFrames()
     {
-        var bindings = stackalloc VkDescriptorSetLayoutBinding[3];
-        for (var i = 0; i < 3; ++i) bindings[i] = new() { Binding = i, DescriptorType = VkDescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = Stages };
-        _setLayout = _device.CreateDescriptorSetLayout(new VkDescriptorSetLayoutCreateInfo { BindingCount = 3, Bindings = bindings }, null);
-        var poolSize = new VkDescriptorPoolSize { Type = VkDescriptorType.StorageBuffer, DescriptorCount = FramesInFlight * 3 };
-        _descriptorPool = _device.CreateDescriptorPool(new VkDescriptorPoolCreateInfo { MaxSets = FramesInFlight, PoolSizeCount = 1, PoolSizes = &poolSize }, null);
+        var bindings = stackalloc VkDescriptorSetLayoutBinding[5];
+        for (var i = 0; i < 5; ++i) bindings[i] = new() { Binding = i,
+            DescriptorType = i == 3 ? VkDescriptorType.CombinedImageSampler : VkDescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = Stages };
+        _setLayout = _device.CreateDescriptorSetLayout(new VkDescriptorSetLayoutCreateInfo { BindingCount = 5, Bindings = bindings }, null);
+        var poolSizes = stackalloc VkDescriptorPoolSize[2];
+        poolSizes[0] = new() { Type = VkDescriptorType.StorageBuffer, DescriptorCount = FramesInFlight * 4 };
+        poolSizes[1] = new() { Type = VkDescriptorType.CombinedImageSampler, DescriptorCount = FramesInFlight };
+        _descriptorPool = _device.CreateDescriptorPool(new VkDescriptorPoolCreateInfo { MaxSets = FramesInFlight, PoolSizeCount = 2, PoolSizes = poolSizes }, null);
         var layout = _setLayout;
-        var push = new VkPushConstantRange { StageFlags = Stages, Size = (ByteSize32)68 };
+        var push = new VkPushConstantRange { StageFlags = Stages, Size = (ByteSize32)96 };
         _pipelineLayout = _device.CreatePipelineLayout(new VkPipelineLayoutCreateInfo { SetLayoutCount = 1, SetLayouts = &layout, PushConstantRangeCount = 1, PushConstantRanges = &push }, null);
-        var infos = stackalloc VkDescriptorBufferInfo[3];
-        var writes = stackalloc VkWriteDescriptorSet[3];
+        var pyramidBindings = stackalloc VkDescriptorSetLayoutBinding[2];
+        pyramidBindings[0] = new() { Binding = 0, DescriptorType = VkDescriptorType.CombinedImageSampler, DescriptorCount = 1, StageFlags = VkShaderStageFlags.ComputeBit };
+        pyramidBindings[1] = new() { Binding = 1, DescriptorType = VkDescriptorType.StorageImage, DescriptorCount = 1, StageFlags = VkShaderStageFlags.ComputeBit };
+        _pyramidSetLayout = _device.CreateDescriptorSetLayout(new VkDescriptorSetLayoutCreateInfo { BindingCount = 2, Bindings = pyramidBindings }, null);
+        var pyramidLayout = _pyramidSetLayout;
+        var pyramidPush = new VkPushConstantRange { StageFlags = VkShaderStageFlags.ComputeBit, Size = (ByteSize32)16 };
+        _pyramidPipelineLayout = _device.CreatePipelineLayout(new VkPipelineLayoutCreateInfo { SetLayoutCount = 1, SetLayouts = &pyramidLayout,
+            PushConstantRangeCount = 1, PushConstantRanges = &pyramidPush }, null);
+        _depthSampler = _device.CreateSampler(new VkSamplerCreateInfo { MagFilter = VkFilter.Nearest, MinFilter = VkFilter.Nearest,
+            MipmapMode = VkSamplerMipmapMode.Nearest, AddressModeU = VkSamplerAddressMode.ClampToEdge, AddressModeV = VkSamplerAddressMode.ClampToEdge,
+            AddressModeW = VkSamplerAddressMode.ClampToEdge, MaxLod = 32 }, null);
+        var infos = stackalloc VkDescriptorBufferInfo[4];
+        var writes = stackalloc VkWriteDescriptorSet[4];
         for (var i = 0; i < FramesInFlight; ++i)
         {
             var f = new FrameResources();
@@ -271,19 +339,23 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             f.Staging = new(_device, _options.UploadBytesPerFrame, VkBufferUsageFlags.TransferSrcBit, true);
             f.Chunks = new(_device, checked(_options.MaxChunks * 32), VkBufferUsageFlags.StorageBufferBit, true);
             f.Indirect = new(_device, checked(_options.MaxChunks * 16), VkBufferUsageFlags.StorageBufferBit | VkBufferUsageFlags.IndirectBufferBit, false);
+            f.Visibility = new(_device, checked(_options.MaxChunks * 4 + 32), VkBufferUsageFlags.StorageBufferBit, true);
             VkDescriptorSet set;
             _device.AllocateDescriptorSets(new VkDescriptorSetAllocateInfo { DescriptorPool = _descriptorPool, DescriptorSetCount = 1, SetLayouts = &layout }, new Span<VkDescriptorSet>(&set, 1));
             f.Set = set;
             infos[0] = new() { Buffer = _quads.Handle, Range = (ByteSize64)_quads.Size };
             infos[1] = new() { Buffer = f.Chunks.Handle, Range = (ByteSize64)f.Chunks.Size };
             infos[2] = new() { Buffer = f.Indirect.Handle, Range = (ByteSize64)f.Indirect.Size };
-            for (var b = 0; b < 3; ++b) writes[b] = new() { DstSet = set, DstBinding = b, DescriptorCount = 1, DescriptorType = VkDescriptorType.StorageBuffer, BufferInfo = infos + b };
-            _device.UpdateDescriptorSets(new ReadOnlySpan<VkWriteDescriptorSet>(writes, 3), []);
+            infos[3] = new() { Buffer = f.Visibility.Handle, Range = (ByteSize64)f.Visibility.Size };
+            for (var b = 0; b < 4; ++b) writes[b] = new() { DstSet = set, DstBinding = b == 3 ? 4 : b, DescriptorCount = 1,
+                DescriptorType = VkDescriptorType.StorageBuffer, BufferInfo = infos + b };
+            _device.UpdateDescriptorSets(new ReadOnlySpan<VkWriteDescriptorSet>(writes, 4), []);
         }
     }
 
     private int RecordUploads(FrameResources frame)
     {
+        UploadCapacityBlocked = false;
         var bytes = 0;
         while (_uploadOrder.First is { } first)
         {
@@ -293,7 +365,11 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             if (bytes + length > _options.UploadBytesPerFrame) break;
             if (!_resident.ContainsKey(key) && _resident.Count >= _options.MaxChunks) break;
             // Residency pressure is backpressure, not a crash or permission to overwrite live data.
-            if (!_arena.TryAllocate(mesh.Quads.Length, out var range)) break;
+            if (!_arena.TryAllocate(mesh.Quads.Length, out var range))
+            {
+                UploadCapacityBlocked = true;
+                break;
+            }
             if (length > 0)
             {
                 MemoryMarshal.AsBytes(mesh.Quads).CopyTo(new Span<byte>(frame.Staging.Mapped + bytes, length));
@@ -301,7 +377,9 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
                 _device.PInvoke.vkCmdCopyBuffer.Invoke(frame.Command, frame.Staging.Handle, _quads.Handle, 1, &region);
             }
             if (_resident.Remove(key, out var old)) _retired.Enqueue((_submitted, old.Range));
-            _resident[key] = new(key, mesh.Revision, range);
+            _resident[key] = new(key, range);
+            if (!_latestMeshByKey.TryGetValue(key.Key, out var latest) || latest.Revision <= key.Revision)
+                _latestMeshByKey[key.Key] = key;
             _pending.Remove(key);
             _pendingUploadBytes -= mesh.ByteSize;
             _uploadNodes.Remove(key);
@@ -314,14 +392,22 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     private int WriteChunks(FrameResources frame, RenderCamera camera)
     {
         var span = new Span<GpuChunk>(frame.Chunks.Mapped, _options.MaxChunks);
+        new Span<byte>(frame.Visibility.Mapped, 32).Clear();
+        var ids = new List<ChunkMeshId>();
         var i = 0;
         foreach (var mesh in _resident.Values)
         {
-            var k = mesh.Key;
+            var k = mesh.Id.Key;
             if (_activeChunks != null && !_activeChunks.Contains(k)) continue;
+            if (_activeMeshes != null && !_activeMeshes.Contains(mesh.Id)) continue;
+            // Legacy key-only mode draws the latest publication while retaining backing versions.
+            if (_activeMeshes == null && _latestMeshByKey[k] != mesh.Id) continue;
             span[i++] = new() { OriginScale = new(camera.Position.RelativeOrigin(k), k.VoxelScale),
-                FirstQuad = (uint)mesh.Range.Offset, QuadCount = (uint)mesh.Range.Count };
+                FirstQuad = (uint)mesh.Range.Offset, QuadCount = (uint)mesh.Range.Count,
+                Reserved0 = _visibilityHistory.Contains(mesh.Id) ? 1u : 0u };
+            ids.Add(mesh.Id);
         }
+        frame.SubmittedMeshes = ids.ToArray();
         return i;
     }
 
@@ -336,35 +422,68 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dep);
         }
         // System.Numerics stores a row-vector matrix; its bytes are the GLSL column-vector transpose.
-        var push = new PushData { ViewProjection = camera.ViewProjection, Count = (uint)count };
-        vk.vkCmdPushConstants.Invoke(f.Command, _pipelineLayout, Stages, 0, 68, &push);
-        var set = f.Set;
-        if (count > 0)
-        {
-            vk.vkCmdBindPipeline.Invoke(f.Command, VkPipelineBindPoint.Compute, _cullPipeline);
-            vk.vkCmdBindDescriptorSets.Invoke(f.Command, VkPipelineBindPoint.Compute, _pipelineLayout, 0, 1, &set, 0, null);
-            vk.vkCmdDispatch.Invoke(f.Command, (count + 63) / 64, 1, 1);
-            var memory = new VkMemoryBarrier2 { SrcStageMask = VkPipelineStageFlags2.ComputeShaderBit, SrcAccessMask = VkAccessFlags2.ShaderStorageWriteBit,
-                DstStageMask = VkPipelineStageFlags2.DrawIndirectBit, DstAccessMask = VkAccessFlags2.IndirectCommandReadBit };
-            var dep = new VkDependencyInfo { MemoryBarrierCount = 1, MemoryBarriers = &memory };
-            vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dep);
-        }
+        var push = new PushData { ViewProjection = camera.ViewProjection, Count = (uint)count,
+            Occlusion = OcclusionEnabled ? 1u : 0u, ViewportPyramid = new(_extent.Width, _extent.Height, _pyramidWidth, _pyramidHeight) };
+        // The descriptor is valid in both branches, including the first frame before any pyramid build.
+        var initialPyramid = ImageBarrier(f.Pyramid, VkImageLayout.Undefined, VkImageLayout.General,
+            VkPipelineStageFlags2.ComputeShaderBit, VkAccessFlags2.ShaderSampledReadBit | VkAccessFlags2.ShaderStorageWriteBit,
+            VkPipelineStageFlags2.ComputeShaderBit, VkAccessFlags2.ShaderStorageWriteBit | VkAccessFlags2.ShaderSampledReadBit, VkImageAspectFlags.ColorBit);
+        initialPyramid.SubresourceRange.LevelCount = _pyramidMips;
+        var initialDependency = new VkDependencyInfo { ImageMemoryBarrierCount = 1, ImageMemoryBarriers = &initialPyramid };
+        vk.vkCmdPipelineBarrier2.Invoke(f.Command, &initialDependency);
+        DispatchCull(f, push, count);
         var barriers = stackalloc VkImageMemoryBarrier2[2];
         barriers[0] = ImageBarrier(_images[imageIndex], VkImageLayout.Undefined, VkImageLayout.ColorAttachmentOptimal,
             // Chain the acquire wait at COLOR_ATTACHMENT_OUTPUT through this layout transition.
             VkPipelineStageFlags2.ColorAttachmentOutputBit, VkAccessFlags2.None,
             VkPipelineStageFlags2.ColorAttachmentOutputBit, VkAccessFlags2.ColorAttachmentWriteBit, VkImageAspectFlags.ColorBit);
         barriers[1] = ImageBarrier(f.Depth, VkImageLayout.Undefined, VkImageLayout.DepthAttachmentOptimal,
-            VkPipelineStageFlags2.EarlyFragmentTestsBit | VkPipelineStageFlags2.LateFragmentTestsBit, VkAccessFlags2.DepthStencilAttachmentWriteBit,
+            VkPipelineStageFlags2.AllCommandsBit, VkAccessFlags2.MemoryReadBit | VkAccessFlags2.MemoryWriteBit,
             VkPipelineStageFlags2.EarlyFragmentTestsBit | VkPipelineStageFlags2.LateFragmentTestsBit,
             VkAccessFlags2.DepthStencilAttachmentReadBit | VkAccessFlags2.DepthStencilAttachmentWriteBit, VkImageAspectFlags.DepthBit);
         var dependency = new VkDependencyInfo { ImageMemoryBarrierCount = 2, ImageMemoryBarriers = barriers };
         vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dependency);
+        DrawChunkPass(f, imageIndex, count, clear: true);
+        if (OcclusionEnabled)
+        {
+            BuildDepthPyramid(f);
+            // The early indirect read must finish before the late compute overwrites its commands.
+            var memory = new VkMemoryBarrier2
+            {
+                SrcStageMask = VkPipelineStageFlags2.DrawIndirectBit | VkPipelineStageFlags2.ComputeShaderBit,
+                SrcAccessMask = VkAccessFlags2.IndirectCommandReadBit | VkAccessFlags2.ShaderStorageWriteBit,
+                DstStageMask = VkPipelineStageFlags2.ComputeShaderBit,
+                DstAccessMask = VkAccessFlags2.ShaderStorageReadBit | VkAccessFlags2.ShaderStorageWriteBit | VkAccessFlags2.ShaderSampledReadBit,
+            };
+            dependency = new() { MemoryBarrierCount = 1, MemoryBarriers = &memory };
+            vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dependency);
+            push.Pass = 1;
+            DispatchCull(f, push, count);
+            // Different push-constant layouts were used by reduction; restore the complete graphics range.
+            vk.vkCmdPushConstants.Invoke(f.Command, _pipelineLayout, Stages, 0, 96, &push);
+            barriers[0] = ImageBarrier(f.Depth, VkImageLayout.DepthReadOnlyOptimal, VkImageLayout.DepthAttachmentOptimal,
+                VkPipelineStageFlags2.ComputeShaderBit, VkAccessFlags2.ShaderSampledReadBit,
+                VkPipelineStageFlags2.EarlyFragmentTestsBit | VkPipelineStageFlags2.LateFragmentTestsBit,
+                VkAccessFlags2.DepthStencilAttachmentReadBit | VkAccessFlags2.DepthStencilAttachmentWriteBit, VkImageAspectFlags.DepthBit);
+            barriers[1] = ImageBarrier(_images[imageIndex], VkImageLayout.ColorAttachmentOptimal, VkImageLayout.ColorAttachmentOptimal,
+                VkPipelineStageFlags2.ColorAttachmentOutputBit, VkAccessFlags2.ColorAttachmentWriteBit,
+                VkPipelineStageFlags2.ColorAttachmentOutputBit, VkAccessFlags2.ColorAttachmentReadBit | VkAccessFlags2.ColorAttachmentWriteBit, VkImageAspectFlags.ColorBit);
+            dependency = new() { ImageMemoryBarrierCount = 2, ImageMemoryBarriers = barriers };
+            vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dependency);
+            DrawChunkPass(f, imageIndex, count, clear: false);
+        }
+        FinishFrameReadbackAndPresent(f, imageIndex);
+    }
+
+    private void DrawChunkPass(FrameResources f, int imageIndex, int count, bool clear)
+    {
+        var vk = _device.PInvoke;
         var color = new VkRenderingAttachmentInfo { ImageView = _views[imageIndex], ImageLayout = VkImageLayout.ColorAttachmentOptimal,
-            LoadOp = VkAttachmentLoadOp.Clear, StoreOp = VkAttachmentStoreOp.Store,
+            LoadOp = clear ? VkAttachmentLoadOp.Clear : VkAttachmentLoadOp.Load, StoreOp = VkAttachmentStoreOp.Store,
             ClearValue = new VkClearColorValue { Float32 = new float4(.48f, .64f, .79f, 1) } };
         var depth = new VkRenderingAttachmentInfo { ImageView = f.DepthView, ImageLayout = VkImageLayout.DepthAttachmentOptimal,
-            LoadOp = VkAttachmentLoadOp.Clear, StoreOp = VkAttachmentStoreOp.DontCare, ClearValue = new VkClearDepthStencilValue { Depth = 0 } };
+            LoadOp = clear ? VkAttachmentLoadOp.Clear : VkAttachmentLoadOp.Load, StoreOp = VkAttachmentStoreOp.Store,
+            ClearValue = new VkClearDepthStencilValue { Depth = 0 } };
         var rendering = new VkRenderingInfo { RenderArea = new() { Extent = _extent }, LayerCount = 1,
             ColorAttachmentCount = 1, ColorAttachments = &color, DepthAttachment = &depth };
         vk.vkCmdBeginRendering.Invoke(f.Command, &rendering);
@@ -373,14 +492,10 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         vk.vkCmdSetViewport.Invoke(f.Command, 0, 1, &viewport);
         vk.vkCmdSetScissor.Invoke(f.Command, 0, 1, &scissor);
         vk.vkCmdBindPipeline.Invoke(f.Command, VkPipelineBindPoint.Graphics, _graphicsPipeline);
+        var set = f.Set;
         vk.vkCmdBindDescriptorSets.Invoke(f.Command, VkPipelineBindPoint.Graphics, _pipelineLayout, 0, 1, &set, 0, null);
         if (count > 0) vk.vkCmdDrawIndirect.Invoke(f.Command, f.Indirect.Handle, (ByteSize64)0, count, 16);
         vk.vkCmdEndRendering.Invoke(f.Command);
-        var final = ImageBarrier(_images[imageIndex], VkImageLayout.ColorAttachmentOptimal, VkImageLayout.PresentSrcKHR,
-            VkPipelineStageFlags2.ColorAttachmentOutputBit, VkAccessFlags2.ColorAttachmentWriteBit,
-            VkPipelineStageFlags2.None, VkAccessFlags2.None, VkImageAspectFlags.ColorBit);
-        dependency = new() { ImageMemoryBarrierCount = 1, ImageMemoryBarriers = &final };
-        vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dependency);
     }
 
     private static VkImageMemoryBarrier2 ImageBarrier(VkImage image, VkImageLayout oldLayout, VkImageLayout newLayout,
@@ -418,17 +533,22 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         if (_device != null)
         {
             _device.WaitIdle();
+            foreach (var frame in _frames.OrderBy(f => f.Serial)) ProcessReadback(frame);
             DestroySwapchain();
             if (!_graphicsPipeline.IsNull()) _device.DestroyPipeline(_graphicsPipeline, null);
             if (!_cullPipeline.IsNull()) _device.DestroyPipeline(_cullPipeline, null);
+            if (!_pyramidPipeline.IsNull()) _device.DestroyPipeline(_pyramidPipeline, null);
             foreach (var f in _frames)
             {
-                f.Staging?.Dispose(); f.Chunks?.Dispose(); f.Indirect?.Dispose();
+                f.Staging?.Dispose(); f.Chunks?.Dispose(); f.Indirect?.Dispose(); f.Visibility?.Dispose();
                 if (!f.Acquired.IsNull()) _device.DestroySemaphore(f.Acquired, null);
                 if (!f.Fence.IsNull()) _device.DestroyFence(f.Fence, null);
                 if (!f.Pool.IsNull()) _device.DestroyCommandPool(f.Pool, null);
             }
             if (!_pipelineLayout.IsNull()) _device.DestroyPipelineLayout(_pipelineLayout, null);
+            if (!_pyramidPipelineLayout.IsNull()) _device.DestroyPipelineLayout(_pyramidPipelineLayout, null);
+            if (!_pyramidSetLayout.IsNull()) _device.DestroyDescriptorSetLayout(_pyramidSetLayout, null);
+            if (!_depthSampler.IsNull()) _device.DestroySampler(_depthSampler, null);
             if (!_descriptorPool.IsNull()) _device.DestroyDescriptorPool(_descriptorPool, null);
             if (!_setLayout.IsNull()) _device.DestroyDescriptorSetLayout(_setLayout, null);
             _quads?.Dispose();

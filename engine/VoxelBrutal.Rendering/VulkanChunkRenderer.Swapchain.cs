@@ -11,6 +11,7 @@ public sealed unsafe partial class VulkanChunkRenderer
         if (size.X <= 0 || size.Y <= 0) return;
         _device.WaitIdle();
         _completed = _submitted;
+        foreach (var frame in _frames.OrderBy(f => f.Serial)) ProcessReadback(frame);
         DestroySwapchain();
         var physical = _device.PhysicalDevice;
         var caps = physical.GetSurfaceCapabilitiesKHR(_surface);
@@ -23,6 +24,10 @@ public sealed unsafe partial class VulkanChunkRenderer
         if (_colorFormat != VkFormat.Undefined && _colorFormat != format.Format)
             throw new InvalidOperationException("Surface color format changed; restart to rebuild rendering pipelines.");
         _colorFormat = format.Format;
+        if (_options.EnableColorReadback && (_colorFormat != VkFormat.B8G8R8A8SRGB && _colorFormat != VkFormat.B8G8R8A8UNorm))
+            throw new InvalidOperationException("Test color readback requires a BGRA8 surface format.");
+        if (_options.EnableColorReadback && (caps.SupportedUsageFlags & VkImageUsageFlags.TransferSrcBit) == 0)
+            throw new InvalidOperationException("Surface does not support test color readback.");
         _extent = caps.CurrentExtent.Width == -1
             ? new() { Width = Math.Clamp(size.X, caps.MinImageExtent.Width, caps.MaxImageExtent.Width),
                 Height = Math.Clamp(size.Y, caps.MinImageExtent.Height, caps.MaxImageExtent.Height) }
@@ -34,7 +39,8 @@ public sealed unsafe partial class VulkanChunkRenderer
         _swapchain = _device.CreateSwapchainKHR(new VkSwapchainCreateInfoKHR
         {
             Surface = _surface, MinImageCount = imageCount, ImageFormat = _colorFormat, ImageColorSpace = format.ColorSpace,
-            ImageExtent = _extent, ImageArrayLayers = 1, ImageUsage = VkImageUsageFlags.ColorAttachmentBit,
+            ImageExtent = _extent, ImageArrayLayers = 1,
+            ImageUsage = VkImageUsageFlags.ColorAttachmentBit | (_options.EnableColorReadback ? VkImageUsageFlags.TransferSrcBit : 0),
             ImageSharingMode = VkSharingMode.Exclusive, PreTransform = caps.CurrentTransform,
             CompositeAlpha = alpha, PresentMode = VkPresentModeKHR.FifoKHR, Clipped = true,
         }, null);
@@ -49,8 +55,10 @@ public sealed unsafe partial class VulkanChunkRenderer
             _presentReady[i] = _device.CreateSemaphore(new VkSemaphoreCreateInfo(), null);
         }
         var formatProperties = physical.GetFormatProperties(VkFormat.D32SFloat);
-        if ((formatProperties.OptimalTilingFeatures & VkFormatFeatureFlags.DepthStencilAttachmentBit) == 0)
-            throw new InvalidOperationException("D32_SFLOAT depth attachments unsupported.");
+        var depthFeatures = VkFormatFeatureFlags.DepthStencilAttachmentBit | VkFormatFeatureFlags.SampledImageBit;
+        if ((formatProperties.OptimalTilingFeatures & depthFeatures) != depthFeatures)
+            throw new InvalidOperationException("D32_SFLOAT sampled depth attachments unsupported.");
+        CreatePyramidDescriptorPool();
         foreach (var f in _frames)
         {
             f.Depth = _device.CreateImage(new VkImageCreateInfo
@@ -58,7 +66,7 @@ public sealed unsafe partial class VulkanChunkRenderer
                 ImageType = VkImageType._2D, Format = VkFormat.D32SFloat,
                 Extent = new() { Width = _extent.Width, Height = _extent.Height, Depth = 1 },
                 MipLevels = 1, ArrayLayers = 1, Samples = VkSampleCountFlags._1Bit,
-                Tiling = VkImageTiling.Optimal, Usage = VkImageUsageFlags.DepthStencilAttachmentBit,
+                Tiling = VkImageTiling.Optimal, Usage = VkImageUsageFlags.DepthStencilAttachmentBit | VkImageUsageFlags.SampledBit,
                 SharingMode = VkSharingMode.Exclusive,
             }, null);
             var req = _device.GetImageMemoryRequirements(f.Depth);
@@ -68,6 +76,7 @@ public sealed unsafe partial class VulkanChunkRenderer
             }, null);
             _device.BindImageMemory(f.Depth, f.DepthMemory, (ByteSize64)0);
             f.DepthView = CreateImageView(f.Depth, VkFormat.D32SFloat, VkImageAspectFlags.DepthBit);
+            CreateFramePyramid(f);
         }
     }
 
@@ -81,11 +90,20 @@ public sealed unsafe partial class VulkanChunkRenderer
     {
         foreach (var f in _frames)
         {
+            f.ColorReadback?.Dispose(); f.ColorReadback = null;
+            foreach (var view in f.PyramidMipViews) if (!view.IsNull()) _device.DestroyImageView(view, null);
+            if (!f.PyramidView.IsNull()) _device.DestroyImageView(f.PyramidView, null);
+            if (!f.Pyramid.IsNull()) _device.DestroyImage(f.Pyramid, null);
+            if (!f.PyramidMemory.IsNull()) _device.FreeMemory(f.PyramidMemory, null);
+            f.PyramidMipViews = []; f.PyramidSets = []; f.PyramidView = default; f.Pyramid = default; f.PyramidMemory = default;
+            f.Serial = 0; f.SubmittedMeshes = [];
             if (!f.DepthView.IsNull()) _device.DestroyImageView(f.DepthView, null);
             if (!f.Depth.IsNull()) _device.DestroyImage(f.Depth, null);
             if (!f.DepthMemory.IsNull()) _device.FreeMemory(f.DepthMemory, null);
             f.DepthView = default; f.Depth = default; f.DepthMemory = default;
         }
+        if (!_pyramidDescriptorPool.IsNull()) _device.DestroyDescriptorPool(_pyramidDescriptorPool, null);
+        _pyramidDescriptorPool = default;
         foreach (var view in _views) if (!view.IsNull()) _device.DestroyImageView(view, null);
         foreach (var semaphore in _presentReady) if (!semaphore.IsNull()) _device.DestroySemaphore(semaphore, null);
         if (!_swapchain.IsNull()) _device.DestroySwapchainKHR(_swapchain, null);
