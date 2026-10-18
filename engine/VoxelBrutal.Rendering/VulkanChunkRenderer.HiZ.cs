@@ -150,6 +150,7 @@ public sealed unsafe partial class VulkanChunkRenderer
     private void ProcessReadback(FrameResources f)
     {
         if (f.Serial <= _readbackSerial) return;
+        ReadGpuTimestamps(f);
         var counters = new ReadOnlySpan<uint>(f.Visibility.Mapped, 8);
         _earlyVisible = (int)counters[0]; _lateVisible = (int)counters[1];
         _occluded = (int)counters[2]; _frustumVisible = (int)counters[3]; _drawnQuads = counters[4];

@@ -4,7 +4,7 @@ A modular, editable voxel prototype built on BRUTAL's Vulkan/GLFW bindings. Fram
 
 ## Run
 
-Use a stable **.NET 10 SDK** and a Vulkan 1.3 GPU. Development validation requires `VK_LAYER_KHRONOS_validation` from the Vulkan SDK; `--no-validation` disables it.
+Use a stable **.NET 10 SDK** and a Vulkan 1.3 GPU with current drivers supporting KHR/EXT swapchain maintenance1. Its presentation fences let resources retire safely during resize and mode changes; unsupported GPUs receive a clear startup error. Development validation requires `VK_LAYER_KHRONOS_validation` from the Vulkan SDK; `--no-validation` disables it.
 
 From the repository root in PowerShell:
 
@@ -13,12 +13,19 @@ From the repository root in PowerShell:
 .\build.ps1 Demo
 .\build.ps1 Smoke
 .\build.ps1 Smoke --validate-occlusion
+.\build.ps1 Smoke --validate-ui --report .artifacts/display/ui.json
 .\build.ps1 Smoke --stress --pixel-error 12 --frames 1400
 .\build.ps1 Demo --radius 64 --max-lod 6
 .\build.ps1 Demo --min-y -256 --max-y 1024
 ```
 
-WASD flies, Space/Ctrl moves vertically, Shift accelerates, right mouse or arrows turns, E removes a targeted voxel, Q places grass, and Escape exits. This is a fly-through terrain prototype; collision, persistence and gameplay are still future work.
+WASD flies, Space/Ctrl moves vertically, Shift accelerates, right mouse or arrows turns, E removes a targeted voxel, Q places grass, **F1 opens display settings**, and Escape exits. This is a fly-through terrain prototype; collision, persistence and gameplay are still future work.
+
+The ImGui overlay shows measured FPS, start-to-start frame time, GPU frame time from Vulkan timestamps, and actual device-wide GPU utilization. Display defaults are **borderless, 60 FPS, Mailbox**. The settings window applies window mode, frame cap and supported Vulkan present modes immediately. Ctrl+click the 30–360 FPS slider to type a value; typed values stay within that range. Opening settings captures gameplay controls. Windowed mode restores the saved position and size. Settings reset to defaults on launch.
+
+The frame cap uses a private high-resolution Windows waitable timer and a short final spin, without changing global timer resolution. Pacing and frame-capacity waits happen before input sampling. GPU utilization samples Windows GPU Engine counters in the background, matched to the selected Vulkan adapter's LUID; NVIDIA NVML provides a UUID-matched fallback. This percentage includes other applications. Missing counters display `unavailable`, rather than estimating usage from FPS or GPU timestamps.
+
+Vulkan has no application-level DXGI `FLIP_DISCARD` switch. The renderer negotiates KHR/EXT swapchain maintenance1 for safe presentation fences and compatible dynamic mode changes, plus present ID/wait to limit queued presentation work when supported. Mailbox falls back to guaranteed FIFO if unavailable. A monitor-sized opaque borderless window enables efficient driver/OS paths, but independent flip and compositor latency depend on Windows, the driver and other visible windows; zero DWM overhead is not guaranteed. See the [renderer notes and primary references](VoxelBrutal.Rendering/README.md#presentation-ui-and-timings).
 
 The script selects `.tools/dotnet/dotnet.exe` when present, otherwise the installed SDK. `-DebugBuild` selects Debug. NuGet versions are pinned. This BRUTAL source snapshot omits framework projects/native build inputs, so native integration uses the published bindings while the engine source lives inside this fork. A fresh clone needs an installed SDK; the locally downloaded SDK/cache is ignored by Git.
 
@@ -53,9 +60,15 @@ Spatial closure is implemented. Smooth POP geomorphing, zero LOD popping, conser
 | `--quad-budget-mib N` | Shared packed-quad arena size, default 128 MiB; pressure coarsens an unpublished candidate |
 | `--uniform` | Uniform level selection; default root level equals `--lod`, so use a small radius |
 | `--workers N` | Fixed generation worker count |
+| `--windowed` | Start in decorated windowed mode instead of borderless |
+| `--frame-cap N` | Frame cap, 30–360 FPS; default 60 |
+| `--present-mode MODE` | `mailbox`, `fifo`, `fifo-relaxed`, `immediate`, or supported `fifo-latest-ready` |
+| `--settings-open` | Start with the display settings window open |
+| `--no-ui`, `--uncapped` | Diagnostic switches to disable the overlay or CPU cap |
 | `--no-occlusion` | GPU frustum/depth baseline for comparisons |
 | `--frames N` | Exit after a bounded number of frames |
 | `--validate-occlusion` | Run actual GPU pixel/visibility comparisons against the uncullled reference |
+| `--validate-ui` | Native ImGui input, real window/present-mode changes, GPU timestamps and deadline timer checks |
 | `--report PATH` | Save JSON runtime counters |
 | `--screenshot PATH.ppm` | Save the final GPU-readback image; enables test-only readback overhead |
 
@@ -69,7 +82,7 @@ Spatial closure is implemented. Smooth POP geomorphing, zero LOD popping, conser
 | --- | --- |
 | Core | World data, generation, edits, snapshots, meshing, LOD plans, CPU visibility references, streaming and raycasts |
 | Rendering | BRUTAL/Vulkan resources, mesh arena, version residency, Hi-Z, indirect draws and GPU diagnostics |
-| Demo | GLFW input/camera, adaptive streaming coordinator and GPU validation scenes |
+| Demo | GLFW input/camera, ImGui settings/HUD, frame pacing, GPU utilization, streaming coordinator and validation scenes |
 | Tests | Independent CPU correctness oracles and optional benchmarks |
 
 Textures, ambient lighting, shadows, water, disk storage, collision, mesh shaders and ray tracing remain further milestones. BRUTAL's existing licence/third-party notices remain authoritative; the demo copies its notice and logo assets, while a shipped game also needs the required pre-game display and credits.

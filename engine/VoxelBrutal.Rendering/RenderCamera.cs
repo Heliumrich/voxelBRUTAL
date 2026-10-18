@@ -1,5 +1,7 @@
 using System.Numerics;
 using VoxelBrutal.Core.Lod;
+using Brutal.VulkanApi;
+using Brutal.VulkanApi.Abstractions;
 
 namespace VoxelBrutal.Rendering;
 
@@ -15,6 +17,7 @@ public sealed record RendererOptions
     public bool EnableValidation { get; init; }
     public bool EnableOcclusion { get; init; } = true;
     public bool EnableColorReadback { get; init; }
+    public VkPresentModeKHR PresentMode { get; init; } = VkPresentModeKHR.MailboxKHR;
 }
 
 public readonly record struct RendererStatistics(int ResidentChunks, long ResidentQuads, int PendingUploads,
@@ -23,3 +26,7 @@ public readonly record struct RendererStatistics(int ResidentChunks, long Reside
 
 /// <summary>Test-only final color copy. Pixels are packed BGRA8 in framebuffer row order.</summary>
 public sealed record ColorFrame(int Width, int Height, long Serial, ReadOnlyMemory<byte> Pixels);
+
+/// <summary>Official BRUTAL ImGui backend integration; its main-viewport ring follows CPU frame slots.</summary>
+public sealed record RendererOverlayContext(DeviceEx Device, Brutal.VulkanApi.Queue GraphicsQueue,
+    VkRenderPass RenderPass, int MinImageCount, int ImageCount, VkFormat ColorFormat);

@@ -75,3 +75,26 @@ Visual verification uses `.\build.ps1 Capture --radius 12 --frames 600`, with Lu
 ## Scope of the evidence
 
 The current evidence establishes the modular renderer, selected mixed-LOD surface coverage and GPU Hi-Z behavior on one Windows machine. It does not establish other GPU/vendor/platform behaviour, production frame latency, smooth visual LOD morphing, thin-feature preservation, collision/gameplay or persistence. Next experiments are in [the architecture document](voxel-foundation.md) and [LOD research](voxel-lod-research.md).
+
+## ImGui, display settings and presentation — 2026-10-18
+
+Release solution build: zero warnings/errors. All 41 CPU tests pass. The GPU occlusion regression still passes all 11 comparisons with exact byte equality and zero Vulkan synchronization-validation errors after adding the UI render pass and presentation extensions.
+
+`--validate-ui` exercises the actual Dear ImGui native input queue and BRUTAL Vulkan backend. Ctrl+click, Ctrl+A, typing and Enter produce 144 FPS; typed 1 clamps to 30, 999 clamps to 360, and 60 restores the default. Native F1 events close/reopen settings, which capture gameplay input. The harness also switches every supported present mode on the actual surface: FIFO, FIFO relaxed, Mailbox, Immediate and FIFO latest ready. An unavailable request falls back to FIFO with an explanation. Six window-mode transitions verify decorations, monitor-sized borderless bounds, and exact restoration of the windowed position/size. All pass with zero validation errors, including backend/renderer teardown.
+
+The adapter reports `VK_KHR_swapchain_maintenance1`, compatible dynamic mode switching, and `VK_KHR_present_id`/`VK_KHR_present_wait`. Presentation fences protect retirement; present-wait is optional pacing, not a substitute for those fences. GPU frame timestamps return real nonzero readings. Device-wide utilization comes from Windows GPU Engine counters matched to the Vulkan LUID; the UUID-matched NVML fallback was separately checked against NVIDIA's driver counters. Unavailable identities remain unavailable.
+
+Private high-resolution timer measurements, independent of GPU readback/display refresh:
+
+| Requested cap | Measured FPS |
+| --- | ---: |
+| 30 | 29.991 |
+| 60 | 60.000 |
+| 144 | 143.941 |
+| 360 | 359.807 |
+
+A 1,800-frame 3840×2160 borderless run with the ImGui overlay, Mailbox, the default 60 FPS cap and synchronization validation completed with zero errors. It settled all 8,191 selected chunks across LODs 0–3, containing 5,988,265 resident quads. The final smoothed interval was 16.668 ms (59.995 FPS), with a 3.667 ms GPU timestamp interval. This is a capped functional run, not an uncapped throughput or end-to-end latency benchmark.
+
+A separate 420-frame windowed terrain run produced and visually verified the real GPU-readback overlay/settings image. UI font/spacing scaling follows display DPI. Color readback disables swapchain clipping, since clipped hidden/occluded pixels may otherwise be undefined; normal gameplay keeps clipping enabled. Readback and validation overhead affect the FPS displayed in these captures. Local reports/images are under `.artifacts/display/`.
+
+Windows Independent Flip/DWM composition mode was not measured with ETW/PresentMon. No zero-compositor-latency claim is made. The presentation implementation and capability requirements are documented in the [renderer notes](../engine/VoxelBrutal.Rendering/README.md#presentation-ui-and-timings).

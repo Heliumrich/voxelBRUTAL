@@ -56,6 +56,13 @@ internal sealed class FlyCamera
         Position = new(checked(Position.X + ix), checked(Position.Y + iy), checked(Position.Z + iz), x - ix, y - iy, z - iz);
     }
 
+    public void ReleaseMouse(GlfwWindow window)
+    {
+        if (!looking) return;
+        looking = false;
+        window.SetInputMode(GlfwInputMode.Cursor, Glfw.Constants.GLFW_CURSOR_NORMAL);
+    }
+
     public Matrix4x4 ViewProjection(float aspect)
     {
         Matrix4x4 view = Matrix4x4.CreateLookAt(Vector3.Zero, Forward, Vector3.UnitY);

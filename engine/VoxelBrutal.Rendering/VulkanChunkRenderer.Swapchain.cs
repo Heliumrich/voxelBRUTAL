@@ -15,6 +15,7 @@ public sealed unsafe partial class VulkanChunkRenderer
         DestroySwapchain();
         var physical = _device.PhysicalDevice;
         var caps = physical.GetSurfaceCapabilitiesKHR(_surface);
+        ConfigurePresentModes(physical, ref caps);
         var formats = new VkSurfaceFormatKHR[physical.GetSurfaceFormatsKHR_Count(_surface)];
         physical.GetSurfaceFormatsKHR_Write(_surface, formats);
         if (formats.Length == 0) throw new InvalidOperationException("Surface has no formats.");
@@ -36,24 +37,33 @@ public sealed unsafe partial class VulkanChunkRenderer
         if (caps.MaxImageCount > 0) imageCount = Math.Min(imageCount, caps.MaxImageCount);
         var alpha = new[] { VkCompositeAlphaFlagsKHR.OpaqueBitKHR, VkCompositeAlphaFlagsKHR.PreMultipliedBitKHR,
             VkCompositeAlphaFlagsKHR.PostMultipliedBitKHR, VkCompositeAlphaFlagsKHR.InheritBitKHR }.First(a => (caps.SupportedCompositeAlpha & a) != 0);
-        _swapchain = _device.CreateSwapchainKHR(new VkSwapchainCreateInfoKHR
+        fixed (VkPresentModeKHR* modes = _switchablePresentModes)
         {
-            Surface = _surface, MinImageCount = imageCount, ImageFormat = _colorFormat, ImageColorSpace = format.ColorSpace,
-            ImageExtent = _extent, ImageArrayLayers = 1,
-            ImageUsage = VkImageUsageFlags.ColorAttachmentBit | (_options.EnableColorReadback ? VkImageUsageFlags.TransferSrcBit : 0),
-            ImageSharingMode = VkSharingMode.Exclusive, PreTransform = caps.CurrentTransform,
-            CompositeAlpha = alpha, PresentMode = VkPresentModeKHR.FifoKHR, Clipped = true,
-        }, null);
+            var presentModes = new VkSwapchainPresentModesCreateInfoKHR { PresentModeCount = _switchablePresentModes.Length, PresentModes = modes };
+            _swapchain = _device.CreateSwapchainKHR(new VkSwapchainCreateInfoKHR
+            {
+                Next = _swapchainMaintenance ? &presentModes : null,
+                Surface = _surface, MinImageCount = imageCount, ImageFormat = _colorFormat, ImageColorSpace = format.ColorSpace,
+                ImageExtent = _extent, ImageArrayLayers = 1,
+                ImageUsage = VkImageUsageFlags.ColorAttachmentBit | (_options.EnableColorReadback ? VkImageUsageFlags.TransferSrcBit : 0),
+                ImageSharingMode = VkSharingMode.Exclusive, PreTransform = caps.CurrentTransform,
+                CompositeAlpha = alpha, PresentMode = PresentMode, Clipped = !_options.EnableColorReadback,
+            }, null);
+        }
         _images = new VkImage[_device.GetSwapchainImagesKHR_Count(_swapchain)];
         _device.GetSwapchainImagesKHR_Write(_swapchain, _images);
         _views = new VkImageView[_images.Length];
         _presentReady = new VkSemaphore[_images.Length];
+        _presentationFences = new VkFence[_swapchainMaintenance ? _images.Length : 0];
+        _presentationFencePending = new bool[_presentationFences.Length];
         for (var i = 0; i < _images.Length; ++i)
         {
             _views[i] = CreateImageView(_images[i], _colorFormat, VkImageAspectFlags.ColorBit);
             // Presentation wait semaphores belong to acquired images, not CPU frame slots.
             _presentReady[i] = _device.CreateSemaphore(new VkSemaphoreCreateInfo(), null);
+            if (_swapchainMaintenance) _presentationFences[i] = _device.CreateFence(new VkFenceCreateInfo(), null);
         }
+        CreateOverlayFramebuffers();
         var formatProperties = physical.GetFormatProperties(VkFormat.D32SFloat);
         var depthFeatures = VkFormatFeatureFlags.DepthStencilAttachmentBit | VkFormatFeatureFlags.SampledImageBit;
         if ((formatProperties.OptimalTilingFeatures & depthFeatures) != depthFeatures)
@@ -88,6 +98,7 @@ public sealed unsafe partial class VulkanChunkRenderer
 
     private void DestroySwapchain()
     {
+        WaitPresentationResources();
         foreach (var f in _frames)
         {
             f.ColorReadback?.Dispose(); f.ColorReadback = null;
@@ -104,8 +115,12 @@ public sealed unsafe partial class VulkanChunkRenderer
         }
         if (!_pyramidDescriptorPool.IsNull()) _device.DestroyDescriptorPool(_pyramidDescriptorPool, null);
         _pyramidDescriptorPool = default;
+        foreach (var framebuffer in _overlayFramebuffers) if (!framebuffer.IsNull()) _device.DestroyFramebuffer(framebuffer, null);
+        _overlayFramebuffers = [];
         foreach (var view in _views) if (!view.IsNull()) _device.DestroyImageView(view, null);
         foreach (var semaphore in _presentReady) if (!semaphore.IsNull()) _device.DestroySemaphore(semaphore, null);
+        foreach (var fence in _presentationFences) if (!fence.IsNull()) _device.DestroyFence(fence, null);
+        _presentationFences = []; _presentationFencePending = [];
         if (!_swapchain.IsNull()) _device.DestroySwapchainKHR(_swapchain, null);
         _views = []; _presentReady = []; _images = []; _swapchain = default;
     }

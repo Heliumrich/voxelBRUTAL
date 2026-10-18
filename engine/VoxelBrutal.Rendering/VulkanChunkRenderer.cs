@@ -33,6 +33,11 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     private GCHandle _debugHandle;
     private int _validationErrors;
     private VkSwapchainKHR _swapchain;
+    private VkRenderPass _overlayPass;
+    private VkFramebuffer[] _overlayFramebuffers = [];
+    private VkQueryPool _timestampPool;
+    private float _timestampPeriod;
+    private int _timestampValidBits;
     private VkImage[] _images = [];
     private VkImageView[] _views = [];
     private VkSemaphore[] _presentReady = [];
@@ -79,6 +84,11 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
     public bool OcclusionEnabled { get; set; }
     public IReadOnlySet<ChunkMeshId> LastVisibleMeshes => _visibilityHistory;
     public ColorFrame? LastColorFrame { get; private set; }
+    public ulong? AdapterLuid { get; private set; }
+    public string? DeviceUuid { get; private set; }
+    public double? GpuFrameMs { get; private set; }
+    public Action<CommandBuffer>? OverlayRender { get; set; }
+    public RendererOverlayContext OverlayContext => new((DeviceEx)_device, _queue, _overlayPass, FramesInFlight, FramesInFlight, _colorFormat);
 
     private sealed record Resident(ChunkMeshId Id, QuadArena.Range Range);
     [StructLayout(LayoutKind.Sequential)]
@@ -114,12 +124,14 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         public VkImageView DepthView;
         public VkDeviceMemory DepthMemory;
         public long Serial;
+        public int QueryIndex;
     }
 
     public VulkanChunkRenderer(GlfwWindow window, RendererOptions? options = null)
     {
         _window = window;
         _options = options ?? new();
+        _requestedPresentMode = _options.PresentMode;
         OcclusionEnabled = _options.EnableOcclusion;
         if (_options.QuadCapacity <= 0 || _options.QuadCapacity > int.MaxValue / 8 || _options.MaxChunks <= 0
             || _options.UploadBytesPerFrame < 8 || _options.MaxPendingUploadBytes < _options.UploadBytesPerFrame)
@@ -200,6 +212,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         var size = _window.FramebufferSize;
         if (size.X <= 0 || size.Y <= 0) return false;
+        ApplyPresentModeRequest();
         if (size.X != _extent.Width || size.Y != _extent.Height) RecreateSwapchain();
         var frame = _frames[_frameIndex];
         Check(_device.WaitForFences([frame.Fence], true, -1), "wait frame fence");
@@ -210,15 +223,23 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             _retired.Dequeue();
             _arena.Free(retired.Range);
         }
+        PrepareFrame(); // Also supports callers that do not use the pre-input PrepareFrame hook.
         var acquire = _device.AcquireNextImageKHR(_swapchain, -1, frame.Acquired, default, out var imageIndex);
         if (acquire == VkResult.ErrorOutOfDateKHR) { RecreateSwapchain(); return false; }
         if (acquire != VkResult.SuboptimalKHR) Check(acquire, "acquire swapchain image");
         _device.ResetCommandPool(frame.Pool, 0);
         var begin = new VkCommandBufferBeginInfo { Flags = VkCommandBufferUsageFlags.OneTimeSubmitBit };
         Check(_device.PInvoke.vkBeginCommandBuffer.Invoke(frame.Command, &begin), "begin commands");
+        if (!_timestampPool.IsNull())
+        {
+            _device.PInvoke.vkCmdResetQueryPool.Invoke(frame.Command, _timestampPool, frame.QueryIndex, 2);
+            _device.PInvoke.vkCmdWriteTimestamp2.Invoke(frame.Command, VkPipelineStageFlags2.TopOfPipeBit, _timestampPool, frame.QueryIndex);
+        }
         var uploadBytes = RecordUploads(frame);
         var count = WriteChunks(frame, camera);
         RecordFrame(frame, imageIndex, camera, count, uploadBytes > 0);
+        if (!_timestampPool.IsNull())
+            _device.PInvoke.vkCmdWriteTimestamp2.Invoke(frame.Command, VkPipelineStageFlags2.AllCommandsBit, _timestampPool, frame.QueryIndex + 1);
         Check(_device.PInvoke.vkEndCommandBuffer.Invoke(frame.Command), "end commands");
         // Reset only once submission is certain; out-of-date acquire never leaves an unsignaled fence.
         _device.ResetFences([frame.Fence]);
@@ -229,11 +250,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             CommandBufferInfoCount = 1, CommandBufferInfos = &cmd, SignalSemaphoreInfoCount = 1, SignalSemaphoreInfos = &signal };
         _queue.Submit2(new Span<VkSubmitInfo2>(&submit, 1), frame.Fence);
         frame.Serial = ++_submitted;
-        var swapchain = _swapchain;
-        var ready = _presentReady[imageIndex];
-        var present = new VkPresentInfoKHR { WaitSemaphoreCount = 1, WaitSemaphores = &ready, SwapchainCount = 1,
-            Swapchains = &swapchain, ImageIndices = &imageIndex };
-        var result = _queue.PresentKHR(present);
+        var result = PresentImage(imageIndex);
         if (result is VkResult.ErrorOutOfDateKHR or VkResult.SuboptimalKHR || acquire == VkResult.SuboptimalKHR) RecreateSwapchain();
         else Check(result, "present");
         _frameIndex = (_frameIndex + 1) % FramesInFlight;
@@ -249,6 +266,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         HashSet<string> extensions = [];
         for (var i = 0; i < count; ++i) extensions.Add(Marshal.PtrToStringUTF8((nint)required[i])!);
         if (_options.EnableValidation) extensions.Add("VK_EXT_debug_utils");
+        AddModernSurfaceExtensions(extensions);
         _instance = Vulkan.CreateInstance(new Instance.CreateInfo
         {
             AppInfo = new VkApplicationInfo { ApiVersion = Vulkan13 }, EnabledExtensions = extensions,
@@ -271,9 +289,25 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             var properties = physical.GetProperties();
             if (properties.ApiVersion < Vulkan13 || !physical.ExtensionNames.Contains("VK_KHR_swapchain")) continue;
             var v13 = new VkPhysicalDeviceVulkan13Features();
+            string? maintenanceExtension = _surfaceMaintenanceKhr && physical.ExtensionNames.Contains("VK_KHR_swapchain_maintenance1")
+                ? "VK_KHR_swapchain_maintenance1" : _surfaceMaintenanceExt && physical.ExtensionNames.Contains("VK_EXT_swapchain_maintenance1")
+                    ? "VK_EXT_swapchain_maintenance1" : null;
+            var hasPresentWait = physical.ExtensionNames.Contains("VK_KHR_present_id") && physical.ExtensionNames.Contains("VK_KHR_present_wait");
+            var waitFeature = new VkPhysicalDevicePresentWaitFeaturesKHR();
+            var idFeature = new VkPhysicalDevicePresentIdFeaturesKHR { Next = hasPresentWait ? &waitFeature : null };
+            var maintenanceFeature = new VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR { Next = hasPresentWait ? &idFeature : null };
+            v13.Next = maintenanceExtension is not null ? &maintenanceFeature : hasPresentWait ? &idFeature : null;
+            var latestReadyExtension = physical.ExtensionNames.Contains("VK_KHR_present_mode_fifo_latest_ready")
+                ? "VK_KHR_present_mode_fifo_latest_ready" : physical.ExtensionNames.Contains("VK_EXT_present_mode_fifo_latest_ready")
+                    ? "VK_EXT_present_mode_fifo_latest_ready" : null;
+            var latestReadyFeature = new VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR { Next = v13.Next };
+            if (latestReadyExtension is not null) v13.Next = &latestReadyFeature;
             var features = new VkPhysicalDeviceFeatures2 { Next = &v13 };
             physical.GetFeatures2(ref features);
             if (!v13.DynamicRendering || !v13.Synchronization2 || !features.Features.MultiDrawIndirect || !features.Features.DrawIndirectFirstInstance) continue;
+            // Repeated mode/window changes need an explicit presentation-retirement primitive.
+            // Device/queue idle alone does not prove legacy presentation-engine resource completion.
+            if (!(maintenanceExtension is not null && maintenanceFeature.SwapchainMaintenance1)) continue;
             // BRUTAL represents these Vk uint32_t limits with signed int fields. Reinterpret bits:
             // modern drivers commonly return UINT32_MAX, which would otherwise look like -1.
             if ((uint)properties.Limits.MaxStorageBufferRange < Math.Max((long)_options.QuadCapacity * 8, (long)_options.MaxChunks * 32)
@@ -289,21 +323,50 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
                 var queueInfo = new VkDeviceQueueCreateInfo { QueueFamilyIndex = q, QueueCount = 1, QueuePriorities = &priority };
                 var enabled = new VkPhysicalDeviceFeatures { MultiDrawIndirect = true, DrawIndirectFirstInstance = true };
                 var enabled13 = new VkPhysicalDeviceVulkan13Features { DynamicRendering = true, Synchronization2 = true };
-                _device = physical.CreateDevice(new Device.CreateInfo
+                var enableMaintenance = maintenanceExtension is not null && maintenanceFeature.SwapchainMaintenance1;
+                var enableWait = hasPresentWait && idFeature.PresentId && waitFeature.PresentWait;
+                var enabledWait = new VkPhysicalDevicePresentWaitFeaturesKHR { PresentWait = enableWait };
+                var enabledId = new VkPhysicalDevicePresentIdFeaturesKHR { PresentId = enableWait, Next = enableWait ? &enabledWait : null };
+                var enabledMaintenance = new VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR { SwapchainMaintenance1 = enableMaintenance,
+                    Next = enableWait ? &enabledId : null };
+                enabled13.Next = enableMaintenance ? &enabledMaintenance : enableWait ? &enabledId : null;
+                var enableLatestReady = latestReadyExtension is not null && latestReadyFeature.PresentModeFifoLatestReady;
+                var enabledLatestReady = new VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR
+                { PresentModeFifoLatestReady = enableLatestReady, Next = enabled13.Next };
+                if (enableLatestReady) enabled13.Next = &enabledLatestReady;
+                HashSet<string> deviceExtensions = ["VK_KHR_swapchain"];
+                if (enableMaintenance) deviceExtensions.Add(maintenanceExtension!);
+                if (enableWait) { deviceExtensions.Add("VK_KHR_present_id"); deviceExtensions.Add("VK_KHR_present_wait"); }
+                if (enableLatestReady) deviceExtensions.Add(latestReadyExtension!);
+                _device = physical.CreateDevice(new DeviceEx.CreateInfo
                 {
-                    Extensions = ["VK_KHR_swapchain"], Features = &enabled, Next = &enabled13,
+                    Extensions = deviceExtensions, Features = &enabled, Next = &enabled13,
                     QueueCreateInfos = new ReadOnlySpan<VkDeviceQueueCreateInfo>(&queueInfo, 1),
                 });
                 _queue = _device.GetQueue(q, 0);
+                _swapchainMaintenance = enableMaintenance;
+                SwapchainMaintenanceExtension = enableMaintenance ? maintenanceExtension : null;
+                _presentWaitSupported = enableWait;
+                _fifoLatestReadyEnabled = enableLatestReady;
+                _timestampValidBits = queues[q].TimestampValidBits;
+                _timestampPeriod = properties.Limits.TimestampPeriod;
+                var identity = new VkPhysicalDeviceIdProperties();
+                var properties2 = new VkPhysicalDeviceProperties2 { Next = &identity };
+                physical.GetProperties2(ref properties2);
+                if (identity.DeviceLUIDValid)
+                    AdapterLuid = System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(new ReadOnlySpan<byte>(identity.DeviceLUID, 8));
+                DeviceUuid = new Guid(new ReadOnlySpan<byte>(identity.DeviceUUID, 16), bigEndian: true).ToString("D");
                 DeviceName = Marshal.PtrToStringUTF8((nint)properties.DeviceName)!;
                 return;
             }
         }
-        throw new InvalidOperationException("No GPU supports Vulkan 1.3, graphics+compute+present, dynamic rendering, synchronization2 and multi-draw indirect within the requested arena limits.");
+        throw new InvalidOperationException("No GPU supports the required Vulkan 1.3 graphics/compute/present features and arena limits with safe presentation retirement. This renderer requires VK_KHR_swapchain_maintenance1 (or VK_EXT_swapchain_maintenance1) with the swapchainMaintenance1 feature enabled. VK_KHR_present_wait alone cannot guarantee retirement after an out-of-date present. Update the graphics driver or select a compatible GPU.");
     }
 
     private void CreateDescriptorsAndFrames()
     {
+        if (_timestampValidBits > 0 && _timestampPeriod > 0)
+            _timestampPool = _device.CreateQueryPool(new VkQueryPoolCreateInfo { QueryType = VkQueryType.Timestamp, QueryCount = FramesInFlight * 2 }, null);
         var bindings = stackalloc VkDescriptorSetLayoutBinding[5];
         for (var i = 0; i < 5; ++i) bindings[i] = new() { Binding = i,
             DescriptorType = i == 3 ? VkDescriptorType.CombinedImageSampler : VkDescriptorType.StorageBuffer, DescriptorCount = 1, StageFlags = Stages };
@@ -331,6 +394,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
         for (var i = 0; i < FramesInFlight; ++i)
         {
             var f = new FrameResources();
+            f.QueryIndex = i * 2;
             _frames.Add(f);
             f.Pool = _device.CreateCommandPool(new VkCommandPoolCreateInfo { QueueFamilyIndex = _queue.Family }, null);
             f.Command = _device.AllocateCommandBuffer(new VkCommandBufferAllocateInfo { CommandPool = f.Pool, Level = VkCommandBufferLevel.Primary });
@@ -472,6 +536,7 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             vk.vkCmdPipelineBarrier2.Invoke(f.Command, &dependency);
             DrawChunkPass(f, imageIndex, count, clear: false);
         }
+        RecordOverlay(f, imageIndex);
         FinishFrameReadbackAndPresent(f, imageIndex);
     }
 
@@ -538,6 +603,8 @@ public sealed unsafe partial class VulkanChunkRenderer : IDisposable
             if (!_graphicsPipeline.IsNull()) _device.DestroyPipeline(_graphicsPipeline, null);
             if (!_cullPipeline.IsNull()) _device.DestroyPipeline(_cullPipeline, null);
             if (!_pyramidPipeline.IsNull()) _device.DestroyPipeline(_pyramidPipeline, null);
+            if (!_timestampPool.IsNull()) _device.DestroyQueryPool(_timestampPool, null);
+            if (!_overlayPass.IsNull()) _device.DestroyRenderPass(_overlayPass, null);
             foreach (var f in _frames)
             {
                 f.Staging?.Dispose(); f.Chunks?.Dispose(); f.Indirect?.Dispose(); f.Visibility?.Dispose();
