@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="VoxelBrutal.Core/VoxelBrutal.Core.csproj" />
+  <Project Path="VoxelBrutal.Rendering/VoxelBrutal.Rendering.csproj" />
+  <Project Path="VoxelBrutal.Demo/VoxelBrutal.Demo.csproj" />
+  <Project Path="VoxelBrutal.Tests/VoxelBrutal.Tests.csproj" />
+</Solution>

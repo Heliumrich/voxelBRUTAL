@@ -7,6 +7,8 @@
 
 # BRUTAL Framework
 
+**Voxel engine in this fork:** [build and run the prototype](engine/README.md), [architecture and research](docs/voxel-foundation.md), [LOD and visibility decisions](docs/voxel-lod-research.md). The engine lives under `engine/`; the framework libraries remain unchanged.
+
 **A free, open source C# framework for making games, or your own game engine.**
 
 BRUTAL is a framework. You can make a game directly with it, or use it as the foundation for a separate engine. We made Kitten Space Agency directly on BRUTAL. Ludeon built their Waylith engine on it to move RimWorld off Unity.

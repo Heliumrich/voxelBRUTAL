@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../VoxelBrutal.Core/VoxelBrutal.Core.csproj" />
+    <ProjectReference Include="../VoxelBrutal.Rendering/VoxelBrutal.Rendering.csproj" />
+    <None Include="../../NOTICE.txt" Link="NOTICE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../docs/branding/LOGO_BRUTAL_WHT.png" Link="Assets/LOGO_BRUTAL_WHT.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

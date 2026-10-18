@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../VoxelBrutal.Core/VoxelBrutal.Core.csproj" />
+    <PackageReference Include="Ahwoo.BRUTAL.Glfw" Version="2026.10.4" />
+    <PackageReference Include="Ahwoo.BRUTAL.Vulkan" Version="2026.10.2" />
+    <PackageReference Include="Ahwoo.BRUTAL.Vulkan.Abstractions" Version="2026.10.2" />
+    <PackageReference Include="Ahwoo.BRUTAL.ShaderC" Version="2026.10.2" />
+    <EmbeddedResource Include="Shaders/*.glsl" />
+  </ItemGroup>
+</Project>
